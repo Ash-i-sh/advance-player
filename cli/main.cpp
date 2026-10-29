@@ -4,6 +4,7 @@
 //   advp engines                       engines available on this device
 //   advp bench [--size WxH] [--fps F]  measure engines, pick one for real time
 //   advp convert IN OUT [options]      smooth a file to a higher frame rate
+//   advp play FILE [options]           play with live smoothing, report pacing
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include "advp/convert.h"
 #include "advp/device.h"
 #include "advp/engine.h"
+#include "advp/player.h"
 #include "advp/rate.h"
 
 namespace {
@@ -27,7 +29,9 @@ void usage() {
                "  advp engines\n"
                "  advp bench [--size 1920x1080] [--source-fps 23.976] [--fps auto|60|120]\n"
                "  advp convert IN OUT [--fps 60] [--engine auto|NAME] [--codec hevc|h264]\n"
-               "                      [--quality 1-100] [--frames N]\n");
+               "                      [--quality 1-100] [--frames N]\n"
+               "  advp play FILE [--engine auto|off|NAME] [--start S] [--seconds N] [--fullscreen]\n"
+               "                 [--screenshot FILE.png]\n");
 }
 
 // Returns the value after a flag, or nullptr if the flag is absent.
@@ -132,6 +136,41 @@ int cmd_convert(const std::vector<std::string>& args) {
   return 0;
 }
 
+int cmd_play(const std::vector<std::string>& args) {
+  if (args.empty()) {
+    usage();
+    return 2;
+  }
+  advp::PlayOptions opt;
+  opt.input = args[0];
+  if (const char* v = flag(args, "--engine")) opt.engine = v;
+  if (const char* v = flag(args, "--start")) opt.start = std::atof(v);
+  if (const char* v = flag(args, "--seconds")) opt.max_seconds = std::atof(v);
+  if (const char* v = flag(args, "--screenshot")) opt.screenshot = v;
+  for (const auto& a : args) {
+    if (a == "--fullscreen") opt.fullscreen = true;
+  }
+
+  auto backend = backend_or_die();
+  const auto r = advp::play_file(*backend, opt);
+  if (!r.ok) {
+    std::fprintf(stderr, "play failed: %s\n", r.error.c_str());
+    return 1;
+  }
+  std::printf(
+      "%dx%d %s decode, %.3f fps on a %.1f Hz display\n"
+      "engine %s -> %s (%d changes)\n"
+      "%lld refreshes, %lld frames presented (%lld smoothed), %lld missed, %lld decoder underflows\n"
+      "smoothing GPU time per refresh: mean %.2f ms, p99 %.2f ms, max %.2f ms\n"
+      "frame interval spread: %.3f ms\n",
+      r.width, r.height, r.decoder.c_str(), r.source_fps, r.display_hz, r.start_engine.c_str(),
+      r.final_engine.c_str(), r.engine_changes, static_cast<long long>(r.refreshes),
+      static_cast<long long>(r.presented), static_cast<long long>(r.interpolated),
+      static_cast<long long>(r.missed), static_cast<long long>(r.underflows), r.work_ms_mean,
+      r.work_ms_p99, r.work_ms_max, r.interval_jitter_ms);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -145,6 +184,7 @@ int main(int argc, char** argv) {
   if (command == "engines") return cmd_engines();
   if (command == "bench") return cmd_bench(args);
   if (command == "convert") return cmd_convert(args);
+  if (command == "play") return cmd_play(args);
   usage();
   return 2;
 }

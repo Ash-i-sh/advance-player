@@ -17,8 +17,11 @@ Milestone M0 (engine foundation), macOS:
 - Benchmark-driven engine selection and a runtime governor (no per-device rules).
 - `advp convert`: file → smoothed file, zero-copy hardware decode → GPU →
   hardware encode, audio and subtitles kept, 8-bit and 10-bit.
+- `advp play`: test player window. Smooths live to the display's refresh rate,
+  presents each frame on its exact refresh and reports measured pacing.
+  Video only for now.
 
-Not yet: the player window and UI (Flutter, needs Xcode), Apple's
+Not yet: audio in the player, the real UI (Flutter, needs Xcode), Apple's
 VideoToolbox frame-rate conversion (needs macOS 15.4+ and its SDK), AI
 engines, colour pipeline, network and link playback.
 
@@ -63,6 +66,15 @@ build/advp bench --size 1920x1080
 ```bash
 build/advp convert movie.mkv movie_60.mp4 --fps 60
 ```
+
+```bash
+build/advp play movie.mkv
+```
+
+Player keys: space pause, ←/→ seek 10 s, S smoothing on/off (before/after),
+F full screen, Q or Esc quit. `--engine off|blend|motion-fast|motion` fixes the
+engine; `--seconds N` stops after N seconds and prints pacing stats;
+`--screenshot frame.png` saves one smoothed frame as displayed.
 
 `--fps` takes `60`, `120`, `59.94` or `2x`; an integer keeps NTSC timing
 (23.976 → 59.94). `--engine` takes `auto`, `blend`, `motion-fast` or `motion`.

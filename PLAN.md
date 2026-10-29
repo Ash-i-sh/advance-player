@@ -175,10 +175,32 @@ kept as a possible later addition for other apps' video.
 - Quality (PSNR of rebuilt frames): camera pan 37.9 dB vs 25.9 dB for plain
   frame repeat (+12 dB); moving objects 34.2 vs 26.9 dB (+7.3 dB).
 - Conversion speed: 1080p 23.976 → 59.94 at 2.6–3.3× real time.
-- Waiting on owner: macOS 15.4+ and Xcode (frame-pacing spike, Flutter UI,
-  VideoToolbox L3 engine). Free disk space (~10 GB) must be raised first.
-- Next without Xcode: native AppKit test player for the frame-pacing spike,
-  yt-dlp link spike, motion-search tuning (temporal candidates, vector projection).
+- Frame-pacing spike (native AppKit player, `advp play`), M4 with 100 Hz and
+  75 Hz displays, 23.976 fps sources, 6–8 s runs:
+
+  | Source | Engine | Smoothing per refresh (mean / p99) | Missed refreshes |
+  |---|---|---|---|
+  | 1080p | off | — | 4 of 588 |
+  | 1080p | motion (auto pick) | 2.9 / 5.0 ms | 2 of 793 |
+  | 4K 10-bit | blend (auto pick) | 2.5 / 3.1 ms | 6 of 788 |
+  | 4K 10-bit | motion-fast (forced) | 6.7 / 12.6 ms | 134 of 588 |
+  | 4K 10-bit | motion (forced) | 15.3 / 25.5 ms | 274 of 590 |
+
+  The remaining misses come from the window opening (they also happen with
+  smoothing off). The benchmark's predictions held: at 4K/100 Hz it ruled
+  out `motion-fast` (592 of 500 ms/s budget), and playing it misses frames.
+  Two things mattered: reading the refresh rate from the window's own screen
+  (multi-monitor), and analysing the next source pair in the GPU's idle time
+  instead of on the refresh that needs it (p99 9.9 → 3.2 ms for motion-fast at 1080p).
+- Spike result: go for a native presenter (CAMetalLayer + display link) with
+  smoothing at the display rate. Still open: the same pacing inside Flutter
+  (needs Xcode), audio clock and A/V sync (M1), and cheaper 4K motion, e.g.
+  skipping the full-resolution search level.
+- Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
+  Free disk space (~10 GB) must be raised first.
+- Next without Xcode: audio and A/V sync in the test player, yt-dlp link
+  spike, motion-search tuning (temporal candidates, vector projection,
+  cheaper 4K).
 
 Keeping Windows cheap later: platform-specific code sits behind interfaces from
 day one, and a Windows CI job compiles the shared core on every change so it

@@ -3,12 +3,14 @@
 
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "advp/bench.h"
 #include "advp/governor.h"
 #include "advp/rate.h"
+#include "advp/schedule.h"
 
 namespace {
 
@@ -138,6 +140,58 @@ void test_select_engine() {
 
 }  // namespace
 
+class FakeFrame final : public advp::GpuFrame {
+ public:
+  int width() const override { return 16; }
+  int height() const override { return 16; }
+  bool high_bit_depth() const override { return false; }
+  void* native_handle() const override { return nullptr; }
+};
+
+void test_schedule_24_on_60hz() {
+  advp::FrameSchedule s;
+  std::vector<advp::GpuFramePtr> frames;
+  for (int i = 0; i < 4; ++i) {
+    frames.push_back(std::make_shared<FakeFrame>());
+    s.push(frames.back(), i / 24.0);
+  }
+  // Refreshes at 60 Hz land at 0, 0.4, 0.8, 0.2 (next pair), 0.6...
+  const float expected[] = {0.f, 0.4f, 0.8f, 0.2f, 0.6f};
+  const int pair[] = {0, 0, 0, 1, 1};
+  for (int i = 0; i < 5; ++i) {
+    const auto p = s.at(i / 60.0);
+    expect(near(p.t, expected[i], 1e-4), "60 Hz position " + std::to_string(i));
+    expect(p.a == frames[pair[i]], "60 Hz pair " + std::to_string(i));
+    expect(!p.underflow && !p.finished, "60 Hz has frames");
+    expect(p.c == frames[pair[i] + 2], "60 Hz look-ahead frame " + std::to_string(i));
+  }
+  expect(s.size() == 3, "consumed source frames are released");
+}
+
+void test_schedule_edges() {
+  advp::FrameSchedule s;
+  auto a = std::make_shared<FakeFrame>();
+  auto b = std::make_shared<FakeFrame>();
+  s.push(a, 1.0);
+  s.push(b, 1.0);  // duplicate timestamp is dropped
+  expect(s.size() == 1, "duplicate timestamp dropped");
+  auto p = s.at(0.5);
+  expect(p.a == a && p.t == 0.f && !p.underflow, "before the first frame shows it");
+  p = s.at(1.0 + 1.0 / 24 + 0.001);
+  expect(p.underflow && !p.finished, "next frame overdue is an underflow");
+  s.end();
+  p = s.at(1.2);
+  expect(p.finished && p.a == a, "after the last frame is finished");
+
+  advp::FrameSchedule gap;
+  gap.push(a, 0.0);
+  gap.push(b, 2.0);  // two-second hole in the stream
+  p = gap.at(1.0);
+  expect(p.t == 0.f && p.a == a && p.b == a, "gaps hold the earlier frame");
+  p = gap.at(2.0);
+  expect(p.a == b, "after a gap the later frame shows");
+}
+
 int main() {
   test_24_to_60();
   test_integer_ratio();
@@ -147,6 +201,8 @@ int main() {
   test_governor_steps_down_and_up();
   test_governor_ignores_single_spike();
   test_select_engine();
+  test_schedule_24_on_60hz();
+  test_schedule_edges();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

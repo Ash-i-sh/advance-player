@@ -10,33 +10,16 @@
 #include <vector>
 
 #include "advp/rate.h"
+#include "ffmpeg_util.h"
+#include "video_decoder.h"
 
 extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
-#include <libavutil/pixdesc.h>
-#include <libswscale/swscale.h>
 }
 
 namespace advp {
 namespace {
 
-std::string av_error(int code) {
-  char buf[AV_ERROR_MAX_STRING_SIZE] = {};
-  av_strerror(code, buf, sizeof buf);
-  return buf;
-}
-
-void check(int code, const char* what) {
-  if (code < 0) throw std::runtime_error(std::string(what) + ": " + av_error(code));
-}
-
-struct FormatInput {
-  AVFormatContext* ctx = nullptr;
-  ~FormatInput() { avformat_close_input(&ctx); }
-};
 struct FormatOutput {
   AVFormatContext* ctx = nullptr;
   bool opened = false;
@@ -45,35 +28,10 @@ struct FormatOutput {
     avformat_free_context(ctx);
   }
 };
-struct CodecContext {
-  AVCodecContext* ctx = nullptr;
-  ~CodecContext() { avcodec_free_context(&ctx); }
-};
-struct PacketPtr {
-  AVPacket* pkt = av_packet_alloc();
-  ~PacketPtr() { av_packet_free(&pkt); }
-};
-struct FramePtr {
-  AVFrame* frame = av_frame_alloc();
-  ~FramePtr() { av_frame_free(&frame); }
-};
 
 #if defined(__APPLE__)
-constexpr AVHWDeviceType kHwDevice = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
 constexpr AVPixelFormat kHwFormat = AV_PIX_FMT_VIDEOTOOLBOX;
 #endif
-
-AVPixelFormat pick_format(AVCodecContext*, const AVPixelFormat* formats) {
-  for (const AVPixelFormat* f = formats; *f != AV_PIX_FMT_NONE; ++f) {
-    if (*f == kHwFormat) return *f;
-  }
-  // No hardware path for this stream: take the first software format.
-  for (const AVPixelFormat* f = formats; *f != AV_PIX_FMT_NONE; ++f) {
-    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(*f);
-    if (d && !(d->flags & AV_PIX_FMT_FLAG_HWACCEL)) return *f;
-  }
-  return formats[0];
-}
 
 // Keeps a GpuFrame alive while the encoder holds the AVFrame that wraps it.
 void release_gpu_frame(void* opaque, uint8_t*) { delete static_cast<GpuFramePtr*>(opaque); }
@@ -90,8 +48,8 @@ class Converter {
 
   ConvertResult run() {
     start_clock_ = std::chrono::steady_clock::now();
-    open_input();
-    open_decoder();
+    dec_ = std::make_unique<VideoDecoder>(backend_, opt_.input);
+    open_rates();
     open_output();
     pick_engine();
     process();
@@ -105,38 +63,17 @@ class Converter {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start_clock_).count();
   }
 
-  void open_input() {
-    check(avformat_open_input(&in_.ctx, opt_.input.c_str(), nullptr, nullptr), "open input");
-    check(avformat_find_stream_info(in_.ctx, nullptr), "read stream info");
-    video_index_ = av_find_best_stream(in_.ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    check(video_index_, "find video stream");
-    video_ = in_.ctx->streams[video_index_];
-
-    AVRational fps = video_->avg_frame_rate;
-    if (fps.num <= 0 || fps.den <= 0) fps = video_->r_frame_rate;
-    if (fps.num <= 0 || fps.den <= 0) fps = AVRational{24, 1};
-    source_fps_ = Rational{fps.num, fps.den};
+  void open_rates() {
+    video_index_ = dec_->video_index();
+    video_ = dec_->video_stream();
+    source_fps_ = dec_->frame_rate();
     const auto target = resolve_target_fps(opt_.target_fps.c_str(), source_fps_);
     if (!target) throw std::runtime_error("invalid target frame rate: " + opt_.target_fps);
     target_fps_ = *target;
     rate_ = RateConverter(target_fps_);
     result_.source_fps = source_fps_.value();
     result_.target_fps = target_fps_.value();
-    if (in_.ctx->duration > 0) duration_ = in_.ctx->duration / static_cast<double>(AV_TIME_BASE);
-  }
-
-  void open_decoder() {
-    const AVCodec* codec = avcodec_find_decoder(video_->codecpar->codec_id);
-    if (!codec) throw std::runtime_error("no decoder for this video codec");
-    dec_.ctx = avcodec_alloc_context3(codec);
-    check(avcodec_parameters_to_context(dec_.ctx, video_->codecpar), "decoder parameters");
-    dec_.ctx->pkt_timebase = video_->time_base;
-    AVBufferRef* hw = nullptr;
-    if (av_hwdevice_ctx_create(&hw, kHwDevice, nullptr, nullptr, 0) >= 0) {
-      dec_.ctx->hw_device_ctx = hw;  // the context takes our reference
-      dec_.ctx->get_format = pick_format;
-    }
-    check(avcodec_open2(dec_.ctx, codec, nullptr), "open decoder");
+    duration_ = dec_->duration();
   }
 
   void open_output() {
@@ -144,9 +81,10 @@ class Converter {
           "create output");
     const bool mp4 = is_mp4_family(out_.ctx->oformat);
 
-    stream_map_.assign(in_.ctx->nb_streams, -1);
-    for (unsigned i = 0; i < in_.ctx->nb_streams; ++i) {
-      AVStream* in = in_.ctx->streams[i];
+    AVFormatContext* in_ctx = dec_->format();
+    stream_map_.assign(in_ctx->nb_streams, -1);
+    for (unsigned i = 0; i < in_ctx->nb_streams; ++i) {
+      AVStream* in = in_ctx->streams[i];
       if (static_cast<int>(i) == video_index_) {
         AVStream* out = avformat_new_stream(out_.ctx, nullptr);
         stream_map_[i] = out->index;
@@ -230,27 +168,20 @@ class Converter {
   }
 
   void process() {
-    PacketPtr packet;
-    FramePtr frame;
-    bool stop = false;
-    while (!stop && av_read_frame(in_.ctx, packet.pkt) >= 0) {
-      const int index = packet.pkt->stream_index;
-      if (index == video_index_) {
-        check(avcodec_send_packet(dec_.ctx, packet.pkt), "decode");
-        stop = drain_decoder(frame.frame);
-      } else if (index < static_cast<int>(stream_map_.size()) && stream_map_[index] >= 0) {
-        AVPacket* copy = av_packet_clone(packet.pkt);
-        if (header_written_) {
-          write_copied(copy);
-        } else {
-          pending_packets_.push_back(copy);
-        }
+    const auto copy_other = [this](AVPacket* packet) {
+      const int index = packet->stream_index;
+      if (index >= static_cast<int>(stream_map_.size()) || stream_map_[index] < 0) return;
+      AVPacket* copy = av_packet_clone(packet);
+      if (header_written_) {
+        write_copied(copy);
+      } else {
+        pending_packets_.push_back(copy);
       }
-      av_packet_unref(packet.pkt);
-    }
-    if (!stop) {
-      avcodec_send_packet(dec_.ctx, nullptr);
-      drain_decoder(frame.frame);
+    };
+    DecodedFrame decoded;
+    while (dec_->next(decoded, copy_other)) {
+      on_decoded(decoded);
+      if (opt_.max_source_frames > 0 && result_.source_frames >= opt_.max_source_frames) break;
     }
     if (!header_written_) throw std::runtime_error("no video frames decoded");
 
@@ -263,41 +194,19 @@ class Converter {
     pending_packets_.clear();
   }
 
-  // Returns true once the frame limit is reached.
-  bool drain_decoder(AVFrame* frame) {
-    while (true) {
-      const int rc = avcodec_receive_frame(dec_.ctx, frame);
-      if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return false;
-      check(rc, "decode frame");
-      on_decoded(frame);
-      av_frame_unref(frame);
-      if (opt_.max_source_frames > 0 && result_.source_frames >= opt_.max_source_frames) {
-        return true;
-      }
-    }
-  }
-
-  void on_decoded(AVFrame* frame) {
-    GpuFramePtr gpu;
-    if (frame->format == kHwFormat) {
-      gpu = backend_.wrap_native(frame->data[3]);
-      result_.decoder = "hardware";
-    } else {
-      gpu = upload_software(frame);
-      result_.decoder = "software";
-    }
+  void on_decoded(const DecodedFrame& decoded) {
+    const GpuFramePtr& gpu = decoded.frame;
+    result_.decoder = dec_->hardware() ? "hardware" : "software";
     if (!enc_.ctx) {
+      const AVFrame* props = dec_->properties();
       color_template_ = av_frame_alloc();
-      av_frame_copy_props(color_template_, frame);
-      color_template_->width = frame->width;
-      color_template_->height = frame->height;
-      open_encoder(frame, gpu->high_bit_depth());
+      av_frame_copy_props(color_template_, props);
+      color_template_->width = props->width;
+      color_template_->height = props->height;
+      open_encoder(props, gpu->high_bit_depth());
     }
 
-    int64_t ts = frame->best_effort_timestamp;
-    if (ts == AV_NOPTS_VALUE) ts = frame->pts;
-    double time = ts == AV_NOPTS_VALUE ? last_time_ + 1.0 / source_fps_.value()
-                                       : ts * av_q2d(video_->time_base);
+    const double time = decoded.time;
     ++result_.source_frames;
 
     cur_ = gpu;
@@ -316,31 +225,6 @@ class Converter {
       p.elapsed = elapsed();
       opt_.on_progress(p);
     }
-  }
-
-  GpuFramePtr upload_software(const AVFrame* frame) {
-    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
-    const bool high = desc && desc->comp[0].depth > 8;
-    const AVPixelFormat target = high ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
-    sws_ = sws_getCachedContext(sws_, frame->width, frame->height,
-                                static_cast<AVPixelFormat>(frame->format), frame->width,
-                                frame->height, target, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!sws_) throw std::runtime_error("cannot convert software-decoded frame");
-    if (!sw_frame_ || sw_frame_->width != frame->width || sw_frame_->height != frame->height ||
-        sw_frame_->format != target) {
-      av_frame_free(&sw_frame_);
-      sw_frame_ = av_frame_alloc();
-      sw_frame_->format = target;
-      sw_frame_->width = frame->width;
-      sw_frame_->height = frame->height;
-      check(av_frame_get_buffer(sw_frame_, 0), "allocate conversion frame");
-    }
-    sws_scale(sws_, frame->data, frame->linesize, 0, frame->height, sw_frame_->data,
-              sw_frame_->linesize);
-    auto gpu = backend_.new_frame(frame->width, frame->height, high);
-    backend_.write_planes(*gpu, sw_frame_->data[0], sw_frame_->linesize[0], sw_frame_->data[1],
-                          sw_frame_->linesize[1]);
-    return gpu;
   }
 
   void emit(const std::vector<OutputSlot>& slots) {
@@ -399,7 +283,7 @@ class Converter {
   }
 
   void write_copied(AVPacket* packet) {
-    AVStream* in = in_.ctx->streams[packet->stream_index];
+    AVStream* in = dec_->format()->streams[packet->stream_index];
     AVStream* out = out_.ctx->streams[stream_map_[packet->stream_index]];
     packet->stream_index = out->index;
     av_packet_rescale_ts(packet, in->time_base, out->time_base);
@@ -413,8 +297,6 @@ class Converter {
   ~Converter() {
     for (AVPacket* p : pending_packets_) av_packet_free(&p);
     av_frame_free(&color_template_);
-    av_frame_free(&sw_frame_);
-    sws_freeContext(sws_);
   }
 
  private:
@@ -423,9 +305,8 @@ class Converter {
   ConvertResult result_;
   std::chrono::steady_clock::time_point start_clock_;
 
-  FormatInput in_;
+  std::unique_ptr<VideoDecoder> dec_;
   FormatOutput out_;
-  CodecContext dec_;
   CodecContext enc_;
   int video_index_ = -1;
   AVStream* video_ = nullptr;
@@ -433,8 +314,6 @@ class Converter {
   std::vector<AVPacket*> pending_packets_;
   bool header_written_ = false;
   AVFrame* color_template_ = nullptr;
-  AVFrame* sw_frame_ = nullptr;
-  SwsContext* sws_ = nullptr;
 
   Rational source_fps_;
   Rational target_fps_;
