@@ -29,6 +29,7 @@
 #include "advp/bench.h"
 #include "advp/governor.h"
 #include "advp/player.h"
+#include "advp/rate.h"
 #include "advp/schedule.h"
 #include "advp_shaders.h"
 #include "video_decoder.h"
@@ -90,6 +91,7 @@ namespace {
 constexpr size_t kQueuedFrames = 8;   // decoded source frames held ahead
 constexpr double kBudgetShare = 0.5;  // part of each refresh smoothing may use
 constexpr double kSeekStep = 10.0;
+constexpr double kWarmupSeconds = 0.5;
 
 // Must match PresentParams in present.metal.
 struct PresentParams {
@@ -162,9 +164,10 @@ struct PresentStats {
   double last_time = 0;
   int64_t presented = 0;
   int64_t missed = 0;
-  std::vector<double> intervals;
+  std::vector<double> errors;  // actual minus expected time since the previous frame
 
-  void record(uint64_t generation, double time) {
+  // expected: how long after the previous frame this one should appear.
+  void record(uint64_t generation, double expected, double time) {
     std::lock_guard<std::mutex> lock(mu);
     if (time <= 0) {
       ++missed;  // the drawable never reached the screen
@@ -174,8 +177,8 @@ struct PresentStats {
     if (generation == last_generation && last_time > 0) {
       const double interval = time - last_time;
       if (interval > 0 && interval < 0.25) {
-        intervals.push_back(interval);
-        missed += std::max<long>(0, std::lround(interval / period) - 1);
+        errors.push_back(interval - expected);
+        missed += std::max<long>(0, std::lround((interval - expected) / period));
       }
     }
     last_generation = generation;
@@ -218,6 +221,7 @@ class Player {
     setup_metal();
     open_window();
     open_display_link();
+    choose_output_rate();
     choose_engines();
 
     decode_thread_ = std::thread([this] { decode_loop(); });
@@ -361,12 +365,37 @@ class Player {
     stats_->period = seconds;
   }
 
+  // "display", "fit:N" (highest rate up to N that divides the refresh evenly)
+  // or a fixed rate as accepted by resolve_target_fps.
+  void choose_output_rate() {
+    const std::string& fps = opt_.fps;
+    const double hz = display_hz_;
+    if (fps.empty() || fps == "display") {
+      output_fps_ = 0;
+    } else if (fps.rfind("fit:", 0) == 0) {
+      const double cap = std::atof(fps.c_str() + 4);
+      if (cap <= 0) throw std::runtime_error("bad --fps " + fps);
+      output_fps_ = hz / std::max(1.0, std::ceil(hz / cap - 1e-6));
+    } else {
+      const auto r = resolve_target_fps(fps.c_str(), decoder_->frame_rate());
+      if (!r) throw std::runtime_error("bad --fps " + fps);
+      output_fps_ = r->value();
+    }
+    // Rates within 0.5% of the refresh are treated as the refresh itself.
+    if (output_fps_ > 0 && std::fabs(output_fps_ / hz - 1.0) < 0.005) output_fps_ = 0;
+    const double rate = output_fps_ > 0 ? output_fps_ : hz;
+    const double hold = hz / rate;
+    result_.output_fps = rate;
+    result_.even_cadence = std::fabs(hold - std::round(hold)) < 0.01 && hold >= 0.99;
+    result_.even_fps = hz / std::max(1.0, std::ceil(hz / rate - 1e-6));
+  }
+
   void choose_engines() {
+    const double out_fps = output_fps_ > 0 ? output_fps_ : display_hz_.load();
     if (opt_.engine == "auto") {
       // Measure here, at this video's size, rather than trusting a device list.
       const auto bench = benchmark_engines(backend_, result_.width, result_.height, 12);
-      const auto selection = select_engine(bench, result_.source_fps, display_hz_,
-                                           kBudgetShare);
+      const auto selection = select_engine(bench, result_.source_fps, out_fps, kBudgetShare);
       governor_.emplace(selection.ladder, 0);
       set_engine(governor_->current());
     } else {
@@ -475,7 +504,7 @@ class Player {
       if (std::fabs(period * display_hz_ - 1.0) > 0.01) set_refresh_period(period);
     }
 
-    ScheduledPair pick;
+    double media = 0;
     bool playing = false;
     uint64_t generation = 0;
     {
@@ -491,58 +520,171 @@ class Player {
         }
       }
       if (!clock_running_ && !paused_) return;
-      const double media = paused_ ? paused_media_ : origin_media_ + (present_at - origin_host_);
+      media = paused_ ? paused_media_ : origin_media_ + (present_at - origin_host_);
       current_media_ = media;
-      pick = schedule_.at(media);
       playing = !paused_;
       generation = generation_;
     }
-    cv_.notify_all();  // the schedule may have room for more frames now
+    if (playing) {
+      ++refreshes_;
+      check_thermal();
+    }
+    if (output_fps_ > 0) {
+      fixed_rate_refresh(media, present_at, period, playing, generation);
+    } else {
+      display_rate_refresh(media, present_at, period, playing, generation);
+    }
+  }
 
+  // Display rate: a new frame for every refresh, made during that refresh.
+  void display_rate_refresh(double media, double present_at, double period, bool playing,
+                            uint64_t generation) {
+    const ScheduledPair pick = pick_at(media);
     if (pick.finished) {
       request_stop();
       return;
     }
     if (!pick.a) return;
-    if (playing) {
-      ++refreshes_;
-      if (pick.underflow) ++underflows_;
-      check_thermal();
+    if (playing && pick.underflow) ++underflows_;
+
+    double work_ms = 0;
+    const GpuFramePtr frame = render(pick, playing, &work_ms);
+    report_work(work_ms, period * 1000.0, playing);
+    draw(frame, present_at,
+         playing ? std::optional<Measure>(Measure{generation, period}) : std::nullopt);
+    maybe_screenshot(frame, pick, present_at, playing);
+    analyse_next(pick);
+  }
+
+  // Fixed rate: output frame k belongs at origin + k / fps and stays on
+  // screen until frame k+1 is due. Each frame is made once, ahead of time,
+  // while the previous one is showing, so it gets the whole gap as budget.
+  void fixed_rate_refresh(double media, double present_at, double period, bool playing,
+                          uint64_t generation) {
+    if (generation != out_generation_) {
+      out_generation_ = generation;
+      shown_slot_ = -1;
+      ready_.reset();
+    }
+    const int64_t slot = static_cast<int64_t>(std::floor((media - origin_media_) * output_fps_ + 1e-6));
+    if (slot != shown_slot_) {
+      const ScheduledPair pick = pick_at(slot_time(slot));
+      if (pick.finished) {
+        request_stop();
+        return;
+      }
+      if (!pick.a) return;
+      if (playing && pick.underflow) ++underflows_;
+
+      GpuFramePtr frame;
+      if (ready_ && ready_->slot == slot) {
+        frame = ready_->frame;
+      } else {
+        double work_ms = 0;
+        frame = render(pick, playing, &work_ms);
+        report_work(work_ms, period * 1000.0, playing);
+      }
+      ready_.reset();
+      const double expected = slot_host(slot, period) - slot_host(slot - 1, period);
+      draw(frame, present_at,
+           playing && shown_slot_ >= 0 && slot == shown_slot_ + 1
+               ? std::optional<Measure>(Measure{generation, expected})
+               : std::nullopt);
+      shown_slot_ = slot;
+      maybe_screenshot(frame, pick, present_at, playing);
     }
 
-    const bool smoothing = smoothing_ && slots_[0].engine;
+    // Make the next frame now, while this one is on screen.
+    if (!ready_ && shown_slot_ >= 0) {
+      const int64_t next = shown_slot_ + 1;
+      const ScheduledPair pick = pick_at(slot_time(next));
+      // Only once both of its source frames are decoded; otherwise it is
+      // made on its own refresh.
+      if (pick.a && !pick.finished && (pick.b != pick.a || pick.t == 0.f) && !pick.underflow) {
+        double work_ms = 0;
+        GpuFramePtr frame = render(pick, playing, &work_ms);
+        const double gap = std::max(period, slot_host(next, period) - present_at);
+        report_work(work_ms, gap * 1000.0, playing);
+        ready_ = Ready{next, std::move(frame)};
+        analyse_next(pick);
+      }
+    }
+  }
+
+  double slot_time(int64_t slot) const { return origin_media_ + slot / output_fps_; }
+
+  // The refresh a slot is shown on: the first one at or after its time.
+  double slot_host(int64_t slot, double period) const {
+    const double ideal = slot / output_fps_;
+    return origin_host_ + std::ceil(ideal / period - 1e-6) * period;
+  }
+
+  ScheduledPair pick_at(double time) {
+    ScheduledPair pick;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      pick = schedule_.at(time);
+    }
+    cv_.notify_all();  // the schedule may have room for more frames now
+    return pick;
+  }
+
+  // The frame for pick: a source frame, or an interpolated one.
+  GpuFramePtr render(const ScheduledPair& pick, bool playing, double* work_ms) {
     GpuFramePtr frame = pick.t >= 1.f ? pick.b : pick.a;
-    double work_ms = 0;
-    if (smoothing && pick.t > 0.f && pick.t < 1.f) {
+    if (smoothing_ && slots_[0].engine && pick.t > 0.f && pick.t < 1.f) {
       const double t0 = now_ms();
       Slot& slot = slot_for(pick.a, pick.b);
       frame = backend_.new_frame_like(*pick.a);
       slot.engine->interpolate(pick.t, *frame);
-      work_ms = now_ms() - t0;
+      *work_ms = now_ms() - t0;
       if (playing) {
         ++interpolated_;
-        work_ms_.push_back(work_ms);
+        work_ms_.push_back(*work_ms);
       }
     }
+    return frame;
+  }
+
+  // window_ms: time this frame had before it was due. Load is judged over a
+  // source frame's worth of output, because motion analysis lands on one
+  // frame per source pair; a frame that overran its own window counts at once.
+  void report_work(double work_ms, double window_ms, bool playing) {
     recent_work_ms_ = recent_work_ms_ * 0.95 + work_ms * 0.05;
-
-    if (governor_ && playing && smoothing_) {
-      governor_->report(work_ms, period * 1000.0 * kBudgetShare);
-      if (governor_->take_changed()) {
-        set_engine(governor_->current());
-        ++engine_changes_;
-      }
+    if (!governor_ || !playing || !smoothing_) return;
+    // The first frames after a start or seek have no work done ahead; judge
+    // the engine on steady playback.
+    if (current_media_ - origin_media_ < kWarmupSeconds) return;
+    if (work_ms > window_ms) {
+      governor_->report(work_ms, window_ms * kBudgetShare);
+      work_sum_ = window_sum_ = 0;
+    } else {
+      work_sum_ += work_ms;
+      window_sum_ += window_ms;
+      if (window_sum_ < 1000.0 / result_.source_fps) return;
+      governor_->report(work_sum_, window_sum_ * kBudgetShare);
+      work_sum_ = window_sum_ = 0;
     }
-    draw(frame, present_at, playing ? std::optional<uint64_t>(generation) : std::nullopt);
-    if (!opt_.screenshot.empty() && !screenshot_taken_ && playing && pick.t > 0.f && pick.t < 1.f &&
-        present_at - origin_host_ >= opt_.screenshot_after) {
-      screenshot_taken_ = true;
-      save_png(frame, opt_.screenshot);
+    if (governor_->take_changed()) {
+      set_engine(governor_->current());
+      ++engine_changes_;
     }
+  }
 
-    // Queue motion analysis of the next pair now, so the GPU does it in the
-    // idle time before the refresh that needs it.
-    if (smoothing && pick.c && pick.b != pick.a) slot_for(pick.b, pick.c);
+  // Queue motion analysis of the next pair now, so the GPU does it in the
+  // idle time before the refresh that needs it.
+  void analyse_next(const ScheduledPair& pick) {
+    if (smoothing_ && slots_[0].engine && pick.c && pick.b != pick.a) slot_for(pick.b, pick.c);
+  }
+
+  void maybe_screenshot(const GpuFramePtr& frame, const ScheduledPair& pick, double present_at,
+                        bool playing) {
+    if (opt_.screenshot.empty() || screenshot_taken_ || !playing || pick.t <= 0.f ||
+        pick.t >= 1.f || present_at - origin_host_ < opt_.screenshot_after) {
+      return;
+    }
+    screenshot_taken_ = true;
+    save_png(frame, opt_.screenshot);
   }
 
   // The engine instance analysing (a, b), starting the analysis if no
@@ -576,7 +718,12 @@ class Player {
     last_thermal_ = state;
   }
 
-  void draw(const GpuFramePtr& frame, double present_at, std::optional<uint64_t> measure) {
+  struct Measure {
+    uint64_t generation;
+    double expected;  // seconds after the previous frame
+  };
+
+  void draw(const GpuFramePtr& frame, double present_at, std::optional<Measure> measure) {
     id<CAMetalDrawable> drawable = [layer_ nextDrawable];
     if (!drawable) return;
 
@@ -602,9 +749,9 @@ class Player {
 
     if (measure) {
       std::shared_ptr<PresentStats> stats = stats_;
-      const uint64_t generation = *measure;
+      const Measure m = *measure;
       [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
-        stats->record(generation, shown.presentedTime);
+        stats->record(m.generation, m.expected, shown.presentedTime);
       }];
     }
     [cb presentDrawable:drawable atTime:present_at];
@@ -684,7 +831,8 @@ class Player {
     [target getBytes:pixels.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
     CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
     CGContextRef ctx = CGBitmapContextCreate(pixels.data(), w, h, 8, w * 4, space,
-                                             kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+                                             static_cast<uint32_t>(kCGImageAlphaNoneSkipFirst) |
+                                                 kCGBitmapByteOrder32Little);
     CGImageRef image = CGBitmapContextCreateImage(ctx);
     NSURL* url = [NSURL fileURLWithPath:@(path.c_str())];
     CGImageDestinationRef dest = CGImageDestinationCreateWithURL(
@@ -758,9 +906,10 @@ class Player {
     }
     NSString* name = [@(opt_.input.c_str()) lastPathComponent];
     window_.title = [NSString
-        stringWithFormat:@"%@ — %s%s · %.3f → %.0f Hz · GPU %.1f ms · missed %lld · %.0f s%s",
+        stringWithFormat:@"%@ — %s%s · %.3f → %.2f fps on %.0f Hz · GPU %.1f ms · missed %lld · %.0f s%s",
                          name, smoothing_ ? engine.c_str() : "off",
                          smoothing_ ? "" : " (S)", result_.source_fps,
+                         output_fps_ > 0 ? output_fps_ : display_hz_.load(),
                          display_hz_.load(), recent_work_ms_.load(), static_cast<long long>(missed), media,
                          paused ? " · paused" : ""];
   }
@@ -833,14 +982,11 @@ class Player {
     std::lock_guard<std::mutex> lock(stats_->mu);
     result_.presented = stats_->presented;
     result_.missed = stats_->missed;
-    const auto& iv = stats_->intervals;
-    if (iv.size() > 1) {
-      double mean = 0;
-      for (double v : iv) mean += v;
-      mean /= iv.size();
-      double var = 0;
-      for (double v : iv) var += (v - mean) * (v - mean);
-      result_.interval_jitter_ms = std::sqrt(var / iv.size()) * 1000.0;
+    const auto& err = stats_->errors;
+    if (!err.empty()) {
+      double sq = 0;
+      for (double v : err) sq += v * v;
+      result_.interval_jitter_ms = std::sqrt(sq / err.size()) * 1000.0;
     }
   }
 
@@ -898,6 +1044,18 @@ class Player {
   int64_t underflows_ = 0;
   std::vector<double> work_ms_;
   bool screenshot_taken_ = false;
+
+  // Fixed output rate (0: one frame per display refresh).
+  struct Ready {
+    int64_t slot;
+    GpuFramePtr frame;
+  };
+  double output_fps_ = 0;
+  double work_sum_ = 0;
+  double window_sum_ = 0;
+  uint64_t out_generation_ = 0;
+  int64_t shown_slot_ = -1;
+  std::optional<Ready> ready_;
 };
 
 }  // namespace

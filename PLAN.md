@@ -172,8 +172,7 @@ kept as a possible later addition for other apps' video.
 - Measured at 1080p: `motion` 5.5 ms per source pair + 1.9 ms per new frame →
   44% of budget at 24→100 fps, so real-time is comfortable. At 4K the selector
   falls back to `motion-fast` automatically.
-- Quality (PSNR of rebuilt frames): camera pan 37.9 dB vs 25.9 dB for plain
-  frame repeat (+12 dB); moving objects 34.2 vs 26.9 dB (+7.3 dB).
+- Quality (PSNR of rebuilt frames, `tests/quality.sh`): see "Motion tuning" below.
 - Conversion speed: 1080p 23.976 → 59.94 at 2.6–3.3× real time.
 - Frame-pacing spike (native AppKit player, `advp play`), M4 with 100 Hz and
   75 Hz displays, 23.976 fps sources, 6–8 s runs:
@@ -198,9 +197,46 @@ kept as a possible later addition for other apps' video.
   skipping the full-resolution search level.
 - Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
   Free disk space (~10 GB) must be raised first.
+- Fixed output rate (`advp play --fps fit:60 | 60 | display`): each frame is
+  made once, ahead of time, while the previous one shows. On the 100 Hz screen
+  `fit:60` runs 50 fps with every frame held exactly two refreshes (0 missed,
+  0.000 ms timing error at 1080p), and 4K 10-bit keeps `motion-fast` where
+  the full refresh rate could only afford `blend`. The governor now judges
+  load per source frame and ignores the first 0.5 s after a start or seek.
+- Motion tuning (2026-10-29). The benchmark was fixed first: its frame
+  pairing was off by one frame on some timestamps (the "26–29 dB outliers"
+  were that), and ffmpeg's whole-pixel crop made the reference pan itself
+  inaccurate; the pan is now rendered exactly (`tests/make_pan.py`).
+  Engine changes:
+  per-pixel vector selection among the smooth field, zero motion and the
+  four nearest raw block vectors; matches scored on half-resolution luma
+  (robust to grain); a forward/backward consistency check picks the right
+  frame for covered/uncovered areas; zero motion is the search fallback with a
+  5% margin.
+
+  | Clip | Engine | Before | After |
+  |---|---|---|---|
+  | Pan (exact sub-pixel) | motion | 41.02 dB | 40.89 dB |
+  | Pan | motion-fast | 38.94 dB | 38.86 dB |
+  | Test card (objects, occlusion, noise) | motion | 34.28 dB (worst 32.78) | 34.72 dB (worst 33.03) |
+  | Test card | motion-fast | 34.26 dB | 34.70 dB |
+
+  Ceilings measured with the true motion: on the pan, luma is within ~1 dB
+  of perfect vectors with our Catmull-Rom output and chroma is at the 4:2:0
+  limit, so pans have little left without a sharper filter (Lanczos: +1.8 dB,
+  ~4x the taps; a candidate for the export engine). Tried and rejected:
+  quarter-pel (<0.1 dB), half-pel and bicubic output for motion-fast (+0.1 dB
+  for +14% cost; +1.2 dB for 2x per-frame cost). The test card's noise
+  squares change every frame, so no method can predict them; its remaining
+  error is mostly that. Speed not re-measured after the last change (the
+  machine was under screen-sharing load).
+- Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
+  Free disk space (~10 GB) must be raised first. A few minutes of real film
+  footage (with grain, pans and moving people) to tune against; synthetic
+  clips cannot show grain or real occlusions.
 - Next without Xcode: audio and A/V sync in the test player, yt-dlp link
-  spike, motion-search tuning (temporal candidates, vector projection,
-  cheaper 4K).
+  spike, temporal vector prediction (steadier vectors between pairs), cheaper
+  4K motion.
 
 Keeping Windows cheap later: platform-specific code sits behind interfaces from
 day one, and a Windows CI job compiles the shared core on every change so it

@@ -19,6 +19,12 @@ struct PlayOptions {
   // "auto": benchmark, pick the best engine that fits, adapt at runtime.
   // An engine name or "off": fixed, for comparisons.
   std::string engine = "auto";
+  // Output frame rate:
+  //   "display"  one frame per refresh (smoothest, most GPU work)
+  //   "fit:60"   highest rate up to 60 that divides the refresh evenly
+  //              (50 on 100 Hz, 60 on 60/120 Hz): steady and lighter
+  //   "60", "2x" exactly that rate; uneven if it does not divide the refresh
+  std::string fps = "display";
   double start = 0;        // seconds into the file
   double max_seconds = 0;  // stop after this long (0: play to the end)
   bool fullscreen = false;
@@ -36,6 +42,9 @@ struct PlayResult {
   std::string decoder;     // "hardware" or "software"
   double source_fps = 0;
   double display_hz = 0;
+  double output_fps = 0;      // frames per second actually produced
+  bool even_cadence = false;  // every frame held for the same number of refreshes
+  double even_fps = 0;        // nearest rate at or below output_fps that would be even
   std::string start_engine;
   std::string final_engine;
   int engine_changes = 0;
@@ -43,12 +52,12 @@ struct PlayResult {
   int64_t refreshes = 0;     // display refreshes while playing
   int64_t presented = 0;     // frames confirmed on screen
   int64_t interpolated = 0;  // of which smoothed in-between frames
-  int64_t missed = 0;        // refreshes that showed no new frame
+  int64_t missed = 0;        // refreshes a frame arrived late by
   int64_t underflows = 0;    // refreshes where the decoder was behind
   double work_ms_mean = 0;   // smoothing GPU time per refresh
   double work_ms_p99 = 0;
   double work_ms_max = 0;
-  double interval_jitter_ms = 0;  // spread of time between presented frames
+  double interval_jitter_ms = 0;  // RMS error of frame timing vs. its schedule
   double seconds = 0;
 };
 

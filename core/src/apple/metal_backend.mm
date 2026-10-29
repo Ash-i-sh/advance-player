@@ -29,6 +29,7 @@ struct SearchParams {
   int subpel;
   float bad_sad;
   int count_stats;
+  float new_penalty;
 };
 
 struct InterpParams {
@@ -39,6 +40,8 @@ struct InterpParams {
   float occlusion_lo;
   float occlusion_hi;
   int bicubic;
+  float candidate_penalty;
+  float score_scale;
 };
 
 bool is_high_bit_depth(OSType format) {
@@ -52,6 +55,12 @@ bool is_supported(OSType format) {
 }
 
 int blocks(int pixels) { return (pixels + 7) / 8; }
+
+
+// Luma mismatch (0..1) charged to the zero-motion and raw-block-vector
+// candidates, so they replace the smooth field only where clearly better.
+// Measured: 0.004 cost pans 0.4 dB; 0.03-0.06 is the plateau on both clips.
+constexpr float kCandidatePenalty = 0.04f;
 
 class MetalFrame final : public GpuFrame {
  public:
@@ -217,7 +226,8 @@ class MetalEngine : public Interpolator {
     const auto& b = as_metal(*b_);
     const auto& o = as_metal(out);
 
-    InterpParams params{t, mode_, cut_fraction_, total_blocks_, 0.06f, 0.16f, bicubic_ ? 1 : 0};
+    InterpParams params{t,     mode_, cut_fraction_, total_blocks_, 0.06f, 0.16f,
+                        bicubic_ ? 1 : 0, kCandidatePenalty, smooth_a() ? 0.5f : 1.0f};
     id<MTLCommandBuffer> cb = [ctx_.queue() commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setTexture:a.y() atIndex:0];
@@ -228,6 +238,8 @@ class MetalEngine : public Interpolator {
     [enc setTexture:backward_field() atIndex:5];
     [enc setTexture:o.y() atIndex:6];
     [enc setTexture:o.uv() atIndex:7];
+    [enc setTexture:(smooth_a() ?: a.y()) atIndex:8];
+    [enc setTexture:(smooth_b() ?: b.y()) atIndex:9];
     [enc setBytes:&params length:sizeof params atIndex:0];
     [enc setBuffer:stats_ offset:0 atIndex:1];
     MetalContext::dispatch(enc, ctx_.pipeline("interpolate_frame"), (o.width() + 1) / 2,
@@ -251,6 +263,9 @@ class MetalEngine : public Interpolator {
  protected:
   virtual id<MTLTexture> forward_field() const { return dummy_field_; }
   virtual id<MTLTexture> backward_field() const { return dummy_field_; }
+  // Half-resolution luma of a and b, for match scoring; nil if none.
+  virtual id<MTLTexture> smooth_a() const { return nil; }
+  virtual id<MTLTexture> smooth_b() const { return nil; }
 
   void check_pair(const GpuFramePtr& a, const GpuFramePtr& b) const {
     if (!a || !b || a->width() != b->width() || a->height() != b->height()) {
@@ -313,8 +328,11 @@ struct MemcSettings {
   int quality_rank;
   int radius;        // coarsest-level search radius
   int refine_iters;  // per level
-  bool subpel;       // half-pel at the finest level
+  int subpel;        // finest level: 0 integer, 1 half-pel, 2 quarter-pel
   float lambda;
+  // Relative SAD margin a non-zero vector needs over zero motion. Keeps
+  // unmatched noise (grain, rain) from picking up chance or inherited motion.
+  float new_penalty;
   bool bicubic;      // sharper output sampling
 };
 
@@ -364,6 +382,8 @@ class MemcEngine final : public MetalEngine {
  protected:
   id<MTLTexture> forward_field() const override { return fwd_filtered_; }
   id<MTLTexture> backward_field() const override { return bwd_filtered_; }
+  id<MTLTexture> smooth_a() const override { return levels_.size() > 1 ? pyramid_a_.at(1) : nil; }
+  id<MTLTexture> smooth_b() const override { return levels_.size() > 1 ? pyramid_b_.at(1) : nil; }
 
  private:
   struct Level {
@@ -427,9 +447,10 @@ class MemcEngine final : public MetalEngine {
     params.radius = settings_.radius;
     params.lambda = settings_.lambda;
     params.refine_iters = settings_.refine_iters;
-    params.subpel = (level == 0 && settings_.subpel) ? 1 : 0;
+    params.subpel = level == 0 ? settings_.subpel : 0;
     params.bad_sad = 20.f;
     params.count_stats = count_stats ? 1 : 0;
+    params.new_penalty = settings_.new_penalty;
 
     [enc setTexture:cur.at(level) atIndex:0];
     [enc setTexture:ref.at(level) atIndex:1];
@@ -460,8 +481,13 @@ class MemcEngine final : public MetalEngine {
   id<MTLTexture> bwd_filtered_;
 };
 
-constexpr MemcSettings kMemcQuality{"motion", 20, 8, 2, true, 0.35f, true};
-constexpr MemcSettings kMemcFast{"motion-fast", 10, 6, 1, false, 0.35f, false};
+// Measured with tests/quality.sh: quarter-pel (subpel 2) gains <0.1 dB; half-pel
+// on motion-fast gains 0.1 dB for 14% more cost; bicubic on motion-fast gains
+// 1.2 dB but doubles its per-frame cost, which 4K real time cannot spare.
+// new_penalty 0.05: 0.1 cost pans 0.15 dB for no gain elsewhere; 0 leaves
+// changing noise (grain) free to pick up chance motion.
+constexpr MemcSettings kMemcQuality{"motion", 20, 8, 2, 1, 0.35f, 0.05f, true};
+constexpr MemcSettings kMemcFast{"motion-fast", 10, 6, 1, 0, 0.35f, 0.05f, false};
 
 class MetalBackend final : public GpuBackend {
  public:

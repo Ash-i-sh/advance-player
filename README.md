@@ -76,6 +76,17 @@ F full screen, Q or Esc quit. `--engine off|blend|motion-fast|motion` fixes the
 engine; `--seconds N` stops after N seconds and prints pacing stats;
 `--screenshot frame.png` saves one smoothed frame as displayed.
 
+Output rate (`--fps`):
+
+| Value | Frames made | When to use |
+|---|---|---|
+| `display` (default) | one per screen refresh | smoothest; most GPU work |
+| `fit:60` | highest rate up to 60 that divides the refresh evenly (50 on 100 Hz, 60 on 60/120 Hz) | steady and lighter; leaves room for a better engine on heavy video |
+| `60`, `2x` | exactly that rate | uneven hold if it does not divide the refresh (the player says so) |
+
+With a fixed rate each frame is made once, ahead of time, while the previous
+one is on screen.
+
 `--fps` takes `60`, `120`, `59.94` or `2x`; an integer keeps NTSC timing
 (23.976 → 59.94). `--engine` takes `auto`, `blend`, `motion-fast` or `motion`.
 
