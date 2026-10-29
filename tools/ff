@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Runs a tool from our LGPL FFmpeg build: tools/ff ffmpeg ..., tools/ff ffprobe ...
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+tool="$1"; shift
+DYLD_LIBRARY_PATH="$ROOT/third_party/ffmpeg/lib" exec "$ROOT/third_party/ffmpeg/bin/$tool" -hide_banner "$@"

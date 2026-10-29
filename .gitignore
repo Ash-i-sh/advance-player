@@ -1,0 +1,10 @@
+.venv/
+build/
+third_party/src/
+third_party/ffmpeg/
+samples/
+*.mp4
+*.mkv
+*.mov
+!tests/fixtures/**
+.DS_Store

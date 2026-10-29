@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache FFmpeg build
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('tools/build_ffmpeg.sh') }}
+      - name: Build LGPL FFmpeg
+        run: test -f third_party/ffmpeg/include/libavcodec/avcodec.h || ./tools/build_ffmpeg.sh
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Engines compile and run
+        run: build/advp engines
+
+  # Keeps the shared core portable while Windows backends wait for Phase 2.
+  windows-portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
