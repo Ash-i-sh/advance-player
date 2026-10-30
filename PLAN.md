@@ -230,10 +230,38 @@ kept as a possible later addition for other apps' video.
   squares change every frame, so no method can predict them; its remaining
   error is mostly that. Speed not re-measured after the last change (the
   machine was under screen-sharing load).
+- Real footage (2026-10-30): a 2.5-minute 4K film trailer (VFX, fire,
+  crowds, fades, ~70 cuts), scored with `tests/film_quality.sh` (24 → 12 →
+  24 fps at 1080p, 1645 rebuilt frames). On ordinary shots motion was already
+  sound (+3.5 dB over blend); the failures were all in three situations:
+  - Fades through black: every block looked unmatched, the search chased
+    chance matches and the occlusion fallback copied warped content. Matching
+    now also scores the reference at the other frame's average brightness
+    (gain about black, from a per-frame mean) and keeps the better score;
+    deep in a fade (one frame nearly black, or >3x brightness change) the
+    pair is blended. The extra score runs only when brightness changed.
+  - Glow or light sweeping over a still logo: the unscaled score keeps those
+    matching (the gain alone made them worse).
+  - Missed scene cuts: chance matches in busy texture (crowds) kept most
+    blocks "matched", so the 55% unmatched threshold missed most cuts and the
+    engine morphed two shots together. Measured on 3439 real 24 fps pairs with
+    68 hand-checked cuts, 12% misses 2 cuts and flags 27 other pairs (fast
+    motion, flashes), where a frame repeats. Tried and rejected: unmatched
+    relative to block texture (grain makes ordinary pairs look unmatched) and
+    colour-histogram change (flashes change it more than some cuts do).
+
+  | Trailer, motion engine | Before | After |
+  |---|---|---|
+  | Mean PSNR of rebuilt frames | 37.72 dB | 38.15 dB |
+  | Frames >6 dB worse than blend | 24 | 3 |
+  | Frames >10 dB worse than blend | 11 | 1 |
+
+  Synthetic clips unchanged (pan 40.89, card 34.72 dB). Still weak: a
+  coloured light sweeping across a still logo (frame 13 of the trailer, 16 dB
+  under blend), and cuts from a dark shot to a bright one. Speed: no slower than
+  before in an A/B run, but absolute timings again under screen-sharing load.
 - Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
-  Free disk space (~10 GB) must be raised first. A few minutes of real film
-  footage (with grain, pans and moving people) to tune against; synthetic
-  clips cannot show grain or real occlusions.
+  Free disk space (~10 GB) must be raised first.
 - Next without Xcode: audio and A/V sync in the test player, yt-dlp link
   spike, temporal vector prediction (steadier vectors between pairs), cheaper
   4K motion.

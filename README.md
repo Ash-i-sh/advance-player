@@ -102,3 +102,13 @@ tests/quality.sh
 
 `quality.sh` renders 60 fps reference clips, drops every other frame, rebuilds
 them with each engine and reports PSNR of the rebuilt frames.
+
+```bash
+tests/film_quality.sh samples/film.mkv
+```
+
+`film_quality.sh` does the same on real footage: it drops every other frame
+of a 24 fps film (24 → 12), rebuilds 24 fps and scores the rebuilt frames,
+leaving out pairs that span a scene cut. Each rebuilt frame spans twice the
+motion that 24 → 48/60 playback sees, so its scores are lower than real use;
+use it to compare engines and builds, and look at the worst frames it lists.

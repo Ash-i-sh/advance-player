@@ -1,7 +1,8 @@
 // Motion-compensated frame interpolation (tier L2) and frame blending (L1).
 //
 // Pipeline per source pair (a, b):
-//   1. Luma pyramid for each frame (downsample2x).
+//   1. Luma pyramid for each frame (downsample2x) and its average brightness
+//      (luma_mean), so fades still match (fade_gain).
 //   2. Hierarchical 8x8 block matching, coarse to fine, in both directions
 //      (motion_search): forward a->b and backward b->a vector fields.
 //   3. 3x3 vector median to remove outliers (vector_median).
@@ -27,6 +28,56 @@ kernel void downsample2x(texture2d<float, access::sample> src [[texture(0)]],
   dst.write(float4(src.sample(kLinear, float2(gid) * 2.0f + 1.0f).r), gid);
 }
 
+// Average of a (small) pyramid level, by one threadgroup of 256 threads.
+kernel void luma_mean(texture2d<float, access::read> src [[texture(0)]],
+                      device float* mean [[buffer(0)]],
+                      uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float partial[256];
+  const uint w = src.get_width();
+  const uint n = w * src.get_height();
+  float s = 0.0f;
+  for (uint i = tid; i < n; i += 256) s += src.read(uint2(i % w, i / w)).r;
+  partial[tid] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint stride = 128; stride > 0; stride /= 2) {
+    if (tid < stride) partial[tid] += partial[tid + stride];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (tid == 0) mean[0] = partial[0] / float(n);
+}
+
+// In a fade, brightness scales towards black from frame to frame, and every
+// block of one frame looks unlike the other: the search would chase chance
+// matches and the output would warp. Matching therefore also scores the
+// reference scaled by this gain about black, which brings it to the other
+// frame's average brightness, and keeps the better of the two scores (a glow
+// brightening part of a still picture changes the average but not the rest).
+// Output pixels keep their real values, so the fade itself still blends.
+// Without a brightness change (most pairs) the second score is skipped; the
+// gain is the same for the whole frame, so all threads take the same branch.
+struct Fade {
+  float gain;
+  float black;
+  bool active;
+};
+
+static Fade fade_gain(float mean_to, float mean_from, float black) {
+  const float from = mean_from - black;
+  // A (nearly) black frame has nothing to scale.
+  const float gain = from < 2.0f / 255.0f ? 1.0f : clamp((mean_to - black) / from, 0.125f, 8.0f);
+  return Fade{gain, black, fabs(gain - 1.0f) > 0.02f};
+}
+
+static float faded(Fade f, float v) { return f.black + f.gain * (v - f.black); }
+
+// Deep in a fade through black (one frame nearly black, or brightness changing
+// several-fold) one frame has too little left to match against: blend.
+static bool deep_fade(float mean_a, float mean_b, float black) {
+  const float a = mean_a - black;
+  const float b = mean_b - black;
+  return min(a, b) < 4.0f / 255.0f || max(a, b) > 3.0f * min(a, b);
+}
+
 // ---------------------------------------------------------- motion search
 
 struct SearchParams {
@@ -39,18 +90,30 @@ struct SearchParams {
   float bad_sad;           // mean abs difference (0..255) meaning "no match"
   int count_stats;         // 1 => count unmatched blocks into stats[0]
   float new_penalty;       // relative SAD surcharge on any non-zero vector
+  float black;             // luma black level (0..1), for fade_gain
 };
 
 // Mean absolute difference (0..255) between an 8x8 block and ref displaced by v.
 static float block_sad(thread const float* blk, texture2d<float, access::sample> ref,
-                       float2 origin, float2 v) {
+                       float2 origin, float2 v, Fade fade) {
   float s = 0.0f;
+  if (!fade.active) {
+    for (int y = 0; y < 8; ++y) {
+      for (int x = 0; x < 8; ++x) {
+        s += fabs(blk[y * 8 + x] - ref.sample(kLinear, origin + float2(x, y) + 0.5f + v).r);
+      }
+    }
+    return s * (255.0f / 64.0f);
+  }
+  float sf = 0.0f;
   for (int y = 0; y < 8; ++y) {
     for (int x = 0; x < 8; ++x) {
-      s += fabs(blk[y * 8 + x] - ref.sample(kLinear, origin + float2(x, y) + 0.5f + v).r);
+      const float r = ref.sample(kLinear, origin + float2(x, y) + 0.5f + v).r;
+      s += fabs(blk[y * 8 + x] - r);
+      sf += fabs(blk[y * 8 + x] - faded(fade, r));
     }
   }
-  return s * (255.0f / 64.0f);
+  return min(s, sf) * (255.0f / 64.0f);
 }
 
 // Zero motion is the fallback: it pays nothing, and any other vector must
@@ -60,8 +123,9 @@ static float block_sad(thread const float* blk, texture2d<float, access::sample>
 // staying still is the far milder mistake.
 static void try_vector(thread const float* blk, texture2d<float, access::sample> ref,
                        float2 origin, float2 v, float2 pred, float lambda, float surcharge,
-                       thread float2& best, thread float& best_cost, thread float& best_sad) {
-  const float sad = block_sad(blk, ref, origin, v);
+                       Fade fade, thread float2& best, thread float& best_cost,
+                       thread float& best_sad) {
+  const float sad = block_sad(blk, ref, origin, v, fade);
   const float2 d = abs(v - pred);
   const bool zero = all(v == 0.0f);
   const float cost = zero ? sad : sad * (1.0f + surcharge) + lambda * (d.x + d.y);
@@ -82,9 +146,12 @@ kernel void motion_search(texture2d<float, access::sample> cur [[texture(0)]],
                           texture2d<float, access::write> field [[texture(3)]],
                           constant SearchParams& p [[buffer(0)]],
                           device atomic_uint* stats [[buffer(1)]],
+                          device const float* cur_mean [[buffer(2)]],
+                          device const float* ref_mean [[buffer(3)]],
                           uint2 gid [[thread_position_in_grid]]) {
   if (int(gid.x) >= p.field_size.x || int(gid.y) >= p.field_size.y) return;
 
+  const Fade fade = fade_gain(cur_mean[0], ref_mean[0], p.black);
   const float2 origin = float2(gid) * 8.0f;
   float blk[64];
   for (int y = 0; y < 8; ++y) {
@@ -101,24 +168,26 @@ kernel void motion_search(texture2d<float, access::sample> cur [[texture(0)]],
   if (p.coarse_field_size.x == 0) {
     for (int dy = -p.radius; dy <= p.radius; ++dy) {
       for (int dx = -p.radius; dx <= p.radius; ++dx) {
-        try_vector(blk, ref, origin, float2(dx, dy), pred, p.lambda, p.new_penalty, best,
-                   best_cost, best_sad);
+        try_vector(blk, ref, origin, float2(dx, dy), pred, p.lambda, p.new_penalty, fade,
+                   best, best_cost, best_sad);
       }
     }
   } else {
     const int2 c = int2(gid) / 2;
     const int2 cs = p.coarse_field_size;
     pred = coarse_vector(coarse, c, cs);
-    try_vector(blk, ref, origin, pred, pred, p.lambda, p.new_penalty, best, best_cost, best_sad);
-    try_vector(blk, ref, origin, float2(0.0f), pred, p.lambda, p.new_penalty, best, best_cost, best_sad);
+    try_vector(blk, ref, origin, pred, pred, p.lambda, p.new_penalty, fade, best, best_cost,
+               best_sad);
+    try_vector(blk, ref, origin, float2(0.0f), pred, p.lambda, p.new_penalty, fade, best,
+               best_cost, best_sad);
     try_vector(blk, ref, origin, coarse_vector(coarse, c + int2(1, 0), cs), pred, p.lambda,
-               p.new_penalty, best, best_cost, best_sad);
+               p.new_penalty, fade, best, best_cost, best_sad);
     try_vector(blk, ref, origin, coarse_vector(coarse, c + int2(-1, 0), cs), pred, p.lambda,
-               p.new_penalty, best, best_cost, best_sad);
+               p.new_penalty, fade, best, best_cost, best_sad);
     try_vector(blk, ref, origin, coarse_vector(coarse, c + int2(0, 1), cs), pred, p.lambda,
-               p.new_penalty, best, best_cost, best_sad);
+               p.new_penalty, fade, best, best_cost, best_sad);
     try_vector(blk, ref, origin, coarse_vector(coarse, c + int2(0, -1), cs), pred, p.lambda,
-               p.new_penalty, best, best_cost, best_sad);
+               p.new_penalty, fade, best, best_cost, best_sad);
   }
 
   for (int i = 0; i < p.refine_iters; ++i) {
@@ -127,7 +196,7 @@ kernel void motion_search(texture2d<float, access::sample> cur [[texture(0)]],
       for (int dx = -1; dx <= 1; ++dx) {
         if (dx == 0 && dy == 0) continue;
         try_vector(blk, ref, origin, center + float2(dx, dy), pred, p.lambda,
-                   p.new_penalty, best, best_cost, best_sad);
+                   p.new_penalty, fade, best, best_cost, best_sad);
       }
     }
   }
@@ -139,7 +208,7 @@ kernel void motion_search(texture2d<float, access::sample> cur [[texture(0)]],
       for (int dx = -1; dx <= 1; ++dx) {
         if (dx == 0 && dy == 0) continue;
         try_vector(blk, ref, origin, center + step * float2(dx, dy), pred, p.lambda,
-                   p.new_penalty, best, best_cost, best_sad);
+                   p.new_penalty, fade, best, best_cost, best_sad);
       }
     }
   }
@@ -219,6 +288,7 @@ struct InterpParams {
   int bicubic;          // 1 => Catmull-Rom output sampling (sharper, slower)
   float candidate_penalty;  // extra error charged to the raw-vector candidates
   float score_scale;        // scoring texture size relative to full resolution
+  float black;              // luma black level (0..1), for fade_gain
 };
 
 // Catmull-Rom bicubic sampling from 9 bilinear taps. Bilinear alone visibly
@@ -279,14 +349,18 @@ struct Candidate {
 // one: 2x2 averaging takes out most grain and noise, which changes every
 // frame and would otherwise make flat areas look like better matches.
 static float patch_error(texture2d<float, access::sample> aL, texture2d<float, access::sample> bL,
-                         float2 pa, float2 pb, float scale) {
+                         float2 pa, float2 pb, float scale, Fade fade) {
   float e = 0.0f;
+  float ef = 0.0f;
   const float2 offs[4] = {float2(-0.75f, -0.75f), float2(0.75f, -0.75f),
                           float2(-0.75f, 0.75f), float2(0.75f, 0.75f)};
   for (int i = 0; i < 4; ++i) {
-    e += fabs(aL.sample(kLinear, pa * scale + offs[i]).r - bL.sample(kLinear, pb * scale + offs[i]).r);
+    const float va = aL.sample(kLinear, pa * scale + offs[i]).r;
+    const float vb = bL.sample(kLinear, pb * scale + offs[i]).r;
+    e += fabs(va - vb);
+    if (fade.active) ef += fabs(va - faded(fade, vb));
   }
-  return e * 0.25f;
+  return (fade.active ? min(e, ef) : e) * 0.25f;
 }
 
 // Forward field lives in a: a point x in a moves to x + v(x) in b. The output
@@ -307,9 +381,9 @@ static Candidate forward_points(texture2d<float, access::read> fwd, float2 p, fl
 static Candidate forward_candidate(texture2d<float, access::read> fwd,
                                    texture2d<float, access::sample> aL,
                                    texture2d<float, access::sample> bL, float2 p, float t,
-                                   float scale) {
+                                   float scale, Fade fade) {
   Candidate c = forward_points(fwd, p, t);
-  c.err = patch_error(aL, bL, c.pa, c.pb, scale);
+  c.err = patch_error(aL, bL, c.pa, c.pb, scale, fade);
   return c;
 }
 
@@ -331,9 +405,9 @@ static Candidate backward_points(texture2d<float, access::read> bwd, float2 p, f
 static Candidate backward_candidate(texture2d<float, access::read> bwd,
                                     texture2d<float, access::sample> aL,
                                     texture2d<float, access::sample> bL, float2 p, float t,
-                                    float scale) {
+                                    float scale, Fade fade) {
   Candidate c = backward_points(bwd, p, t);
-  c.err = patch_error(aL, bL, c.pa, c.pb, scale);
+  c.err = patch_error(aL, bL, c.pa, c.pb, scale, fade);
   return c;
 }
 
@@ -361,11 +435,11 @@ static void points_for(Candidate c, float2 at, float2 q, float t,
 // penalty: added error, so these extra candidates win only when clearly better.
 static Candidate motion_candidate(texture2d<float, access::sample> aL,
                                   texture2d<float, access::sample> bL, float2 p, float2 m,
-                                  float t, float penalty, float scale) {
+                                  float t, float penalty, float scale, Fade fade) {
   Candidate c;
   c.pa = p - t * m;
   c.pb = p + (1.0f - t) * m;
-  c.err = patch_error(aL, bL, c.pa, c.pb, scale) + penalty;
+  c.err = patch_error(aL, bL, c.pa, c.pb, scale, fade) + penalty;
   c.kind = 2;
   return c;
 }
@@ -420,6 +494,8 @@ kernel void interpolate_frame(texture2d<float, access::sample> aY [[texture(0)]]
                               texture2d<float, access::sample> bL [[texture(9)]],
                               constant InterpParams& p [[buffer(0)]],
                               device const uint* stats [[buffer(1)]],
+                              device const float* a_mean [[buffer(2)]],
+                              device const float* b_mean [[buffer(3)]],
                               uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= outUV.get_width() || gid.y >= outUV.get_height()) return;
   const uint2 luma_size = uint2(outY.get_width(), outY.get_height());
@@ -429,7 +505,7 @@ kernel void interpolate_frame(texture2d<float, access::sample> aY [[texture(0)]]
                    float(stats[0]) > p.cut_fraction * float(p.total_blocks);
   if (cut) t = t < 0.5f ? 0.0f : 1.0f;
 
-  if (p.mode == 1 || cut) {
+  if (p.mode == 1 || cut || deep_fade(a_mean[0], b_mean[0], p.black)) {
     for (uint j = 0; j < 2; ++j) {
       for (uint i = 0; i < 2; ++i) {
         const uint2 lp = gid * 2 + uint2(i, j);
@@ -448,23 +524,27 @@ kernel void interpolate_frame(texture2d<float, access::sample> aY [[texture(0)]]
   // and its neighbours' raw vectors, and zero motion, compete as well; the
   // two that best explain both frames are kept.
   const float2 q = float2(gid) * 2.0f + 1.0f;
-  const Candidate fc = forward_candidate(fwd, aL, bL, q, t, p.score_scale);
-  const Candidate bc = backward_candidate(bwd, aL, bL, q, t, p.score_scale);
+  const Fade fade = fade_gain(a_mean[0], b_mean[0], p.black);
+  const Candidate fc = forward_candidate(fwd, aL, bL, q, t, p.score_scale, fade);
+  const Candidate bc = backward_candidate(bwd, aL, bL, q, t, p.score_scale, fade);
   Candidate best1 = fc;
   Candidate best2 = bc;
   if (best2.err < best1.err) {
     best1 = bc;
     best2 = fc;
   }
-  consider(motion_candidate(aL, bL, q, float2(0.0f), t, p.candidate_penalty, p.score_scale), best1, best2);
+  const float pen = p.candidate_penalty;
+  consider(motion_candidate(aL, bL, q, float2(0.0f), t, pen, p.score_scale, fade), best1, best2);
   const float2 g = q / 8.0f - 0.5f;
   const int2 size = int2(fwd.get_width(), fwd.get_height());
   const int2 g0 = int2(floor(g));
   for (int dy = 0; dy <= 1; ++dy) {
     for (int dx = 0; dx <= 1; ++dx) {
       const uint2 at = uint2(clamp(g0 + int2(dx, dy), int2(0), size - 1));
-      consider(motion_candidate(aL, bL, q, fwd.read(at).xy, t, p.candidate_penalty, p.score_scale), best1, best2);
-      consider(motion_candidate(aL, bL, q, -bwd.read(at).xy, t, p.candidate_penalty, p.score_scale), best1, best2);
+      consider(motion_candidate(aL, bL, q, fwd.read(at).xy, t, pen, p.score_scale, fade), best1,
+               best2);
+      consider(motion_candidate(aL, bL, q, -bwd.read(at).xy, t, pen, p.score_scale, fade), best1,
+               best2);
     }
   }
   const float2 da1 = best1.pa - q, db1 = best1.pb - q;

@@ -30,6 +30,7 @@ struct SearchParams {
   float bad_sad;
   int count_stats;
   float new_penalty;
+  float black;
 };
 
 struct InterpParams {
@@ -42,6 +43,7 @@ struct InterpParams {
   int bicubic;
   float candidate_penalty;
   float score_scale;
+  float black;
 };
 
 bool is_high_bit_depth(OSType format) {
@@ -56,11 +58,28 @@ bool is_supported(OSType format) {
 
 int blocks(int pixels) { return (pixels + 7) / 8; }
 
+// Luma black level as the shaders read it (0..1). 10-bit samples sit in the
+// top bits of 16, so video-range black 64 reads as 64 * 64 / 65535.
+float black_level(OSType format) {
+  switch (format) {
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return 16.f / 255.f;
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: return 4096.f / 65535.f;
+    default: return 0.f;  // full range
+  }
+}
+
 
 // Luma mismatch (0..1) charged to the zero-motion and raw-block-vector
 // candidates, so they replace the smooth field only where clearly better.
 // Measured: 0.004 cost pans 0.4 dB; 0.03-0.06 is the plateau on both clips.
 constexpr float kCandidatePenalty = 0.04f;
+
+// Share of unmatched blocks that marks a scene cut. Measured on a 2.5-minute
+// film trailer (24 fps pairs, 68 hand-checked cuts): 0.55 missed most cuts,
+// whose chance matches in busy texture keep many blocks "matched"; 0.12
+// misses 2 and flags 27 of 3249 other pairs (fast motion, flashes). A missed
+// cut morphs two shots together; a false one just repeats a frame.
+constexpr float kMemcCutFraction = 0.12f;
 
 class MetalFrame final : public GpuFrame {
  public:
@@ -72,6 +91,7 @@ class MetalFrame final : public GpuFrame {
       throw std::runtime_error("unsupported pixel format for GPU processing");
     }
     high_ = is_high_bit_depth(format);
+    black_ = black_level(format);
     y_ = plane(cache, 0, high_ ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm, &y_ref_);
     uv_ = plane(cache, 1, high_ ? MTLPixelFormatRG16Unorm : MTLPixelFormatRG8Unorm, &uv_ref_);
   }
@@ -90,6 +110,7 @@ class MetalFrame final : public GpuFrame {
   CVPixelBufferRef buffer() const { return buffer_; }
   id<MTLTexture> y() const { return y_; }
   id<MTLTexture> uv() const { return uv_; }
+  float black() const { return black_; }
 
  private:
   id<MTLTexture> plane(CVMetalTextureCacheRef cache, size_t index, MTLPixelFormat format,
@@ -110,6 +131,7 @@ class MetalFrame final : public GpuFrame {
   id<MTLTexture> y_;
   id<MTLTexture> uv_;
   bool high_ = false;
+  float black_ = 0.f;
 };
 
 const MetalFrame& as_metal(const GpuFrame& frame) {
@@ -217,6 +239,10 @@ class MetalEngine : public Interpolator {
   MetalEngine(MetalContext& ctx, int mode, float cut_fraction)
       : ctx_(ctx), mode_(mode), cut_fraction_(cut_fraction) {
     stats_ = [ctx_.device() newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    const float half = 0.5f;
+    dummy_mean_ = [ctx_.device() newBufferWithBytes:&half
+                                             length:sizeof half
+                                            options:MTLResourceStorageModeShared];
     dummy_field_ = ctx_.texture(1, 1, MTLPixelFormatRGBA32Float);
   }
 
@@ -227,7 +253,8 @@ class MetalEngine : public Interpolator {
     const auto& o = as_metal(out);
 
     InterpParams params{t,     mode_, cut_fraction_, total_blocks_, 0.06f, 0.16f,
-                        bicubic_ ? 1 : 0, kCandidatePenalty, smooth_a() ? 0.5f : 1.0f};
+                        bicubic_ ? 1 : 0, kCandidatePenalty, smooth_a() ? 0.5f : 1.0f,
+                        a.black()};
     id<MTLCommandBuffer> cb = [ctx_.queue() commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setTexture:a.y() atIndex:0];
@@ -242,6 +269,8 @@ class MetalEngine : public Interpolator {
     [enc setTexture:(smooth_b() ?: b.y()) atIndex:9];
     [enc setBytes:&params length:sizeof params atIndex:0];
     [enc setBuffer:stats_ offset:0 atIndex:1];
+    [enc setBuffer:(mean_a() ?: dummy_mean_) offset:0 atIndex:2];
+    [enc setBuffer:(mean_b() ?: dummy_mean_) offset:0 atIndex:3];
     MetalContext::dispatch(enc, ctx_.pipeline("interpolate_frame"), (o.width() + 1) / 2,
                            (o.height() + 1) / 2);
     [enc endEncoding];
@@ -266,6 +295,9 @@ class MetalEngine : public Interpolator {
   // Half-resolution luma of a and b, for match scoring; nil if none.
   virtual id<MTLTexture> smooth_a() const { return nil; }
   virtual id<MTLTexture> smooth_b() const { return nil; }
+  // Average luma of a and b (one float each, from luma_mean); nil if none.
+  virtual id<MTLBuffer> mean_a() const { return nil; }
+  virtual id<MTLBuffer> mean_b() const { return nil; }
 
   void check_pair(const GpuFramePtr& a, const GpuFramePtr& b) const {
     if (!a || !b || a->width() != b->width() || a->height() != b->height()) {
@@ -283,6 +315,7 @@ class MetalEngine : public Interpolator {
   int mode_;
   float cut_fraction_;
   id<MTLBuffer> stats_;
+  id<MTLBuffer> dummy_mean_;
   id<MTLTexture> dummy_field_;
   GpuFramePtr a_;
   GpuFramePtr b_;
@@ -340,7 +373,7 @@ struct MemcSettings {
 class MemcEngine final : public MetalEngine {
  public:
   MemcEngine(MetalContext& ctx, MemcSettings settings)
-      : MetalEngine(ctx, 0, 0.55f), settings_(settings) {
+      : MetalEngine(ctx, 0, kMemcCutFraction), settings_(settings) {
     bicubic_ = settings.bicubic;
   }
 
@@ -364,6 +397,7 @@ class MemcEngine final : public MetalEngine {
     build_pyramid(enc, *b, pyramid_b_);
     a_ = a;
     b_ = b;
+    black_ = as_metal(*a).black();
 
     const int levels = static_cast<int>(levels_.size());
     for (int level = levels - 1; level >= 0; --level) {
@@ -384,6 +418,8 @@ class MemcEngine final : public MetalEngine {
   id<MTLTexture> backward_field() const override { return bwd_filtered_; }
   id<MTLTexture> smooth_a() const override { return levels_.size() > 1 ? pyramid_a_.at(1) : nil; }
   id<MTLTexture> smooth_b() const override { return levels_.size() > 1 ? pyramid_b_.at(1) : nil; }
+  id<MTLBuffer> mean_a() const override { return pyramid_a_.mean; }
+  id<MTLBuffer> mean_b() const override { return pyramid_b_.mean; }
 
  private:
   struct Level {
@@ -394,6 +430,7 @@ class MemcEngine final : public MetalEngine {
   struct Pyramid {
     id<MTLTexture> level0;
     std::vector<id<MTLTexture>> owned;
+    id<MTLBuffer> mean;  // average luma, from the coarsest level
     id<MTLTexture> at(int level) const { return level == 0 ? level0 : owned[level - 1]; }
   };
 
@@ -410,6 +447,8 @@ class MemcEngine final : public MetalEngine {
     }
     for (Pyramid* p : {&pyramid_a_, &pyramid_b_}) {
       p->owned.clear();
+      p->mean = [ctx_.device() newBufferWithLength:sizeof(float)
+                                           options:MTLResourceStorageModePrivate];
       for (size_t i = 1; i < levels_.size(); ++i) {
         p->owned.push_back(ctx_.texture(levels_[i].width, levels_[i].height, MTLPixelFormatR16Float));
       }
@@ -434,6 +473,10 @@ class MemcEngine final : public MetalEngine {
       MetalContext::dispatch(enc, ctx_.pipeline("downsample2x"), levels_[i].width,
                              levels_[i].height);
     }
+    [enc setComputePipelineState:ctx_.pipeline("luma_mean")];
+    [enc setTexture:p.at(static_cast<int>(levels_.size()) - 1) atIndex:0];
+    [enc setBuffer:p.mean offset:0 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
 
   void search(id<MTLComputeCommandEncoder> enc, int level, const Pyramid& cur, const Pyramid& ref,
@@ -451,6 +494,7 @@ class MemcEngine final : public MetalEngine {
     params.bad_sad = 20.f;
     params.count_stats = count_stats ? 1 : 0;
     params.new_penalty = settings_.new_penalty;
+    params.black = black_;
 
     [enc setTexture:cur.at(level) atIndex:0];
     [enc setTexture:ref.at(level) atIndex:1];
@@ -458,6 +502,8 @@ class MemcEngine final : public MetalEngine {
     [enc setTexture:out atIndex:3];
     [enc setBytes:&params length:sizeof params atIndex:0];
     [enc setBuffer:stats_ offset:0 atIndex:1];
+    [enc setBuffer:cur.mean offset:0 atIndex:2];
+    [enc setBuffer:ref.mean offset:0 atIndex:3];
     MetalContext::dispatch(enc, ctx_.pipeline("motion_search"), params.field_size.x,
                            params.field_size.y);
   }
@@ -473,6 +519,7 @@ class MemcEngine final : public MetalEngine {
   int width_ = 0;
   int height_ = 0;
   std::vector<Level> levels_;
+  float black_ = 0.f;
   Pyramid pyramid_a_;
   Pyramid pyramid_b_;
   std::vector<id<MTLTexture>> fwd_;
