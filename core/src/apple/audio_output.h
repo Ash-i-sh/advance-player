@@ -14,7 +14,6 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -59,11 +58,14 @@ class AudioOutput {
   void start();
   void stop();
 
-  // Producer (decode thread). Blocks while the buffer is full, until there
-  // is room or give_up() says the audio is no longer wanted.
+  // Producer side: push(), reset() and buffered() are for one thread (the
+  // decoder). push() blocks while the buffer is full, until there is room or
+  // give_up() says the audio is no longer wanted.
   void push(const float* samples, int frames, double time, const std::function<bool()>& give_up);
   // Drops all buffered audio (seek).
   void reset();
+  // No more audio is coming (end of file): running out is not an underrun.
+  void end() { ended_ = true; }
   // Audio buffered ahead, in seconds.
   double buffered() const;
   // Ends a blocked push() for good (shutdown).
@@ -76,15 +78,27 @@ class AudioOutput {
   void update_latency();
   double latency() const { return latency_; }
 
+  // Read after stop().
   AudioOutputStats stats() const;
 
  private:
+  // Where buffered audio sits in media time: the frame at ring position p
+  // plays at origin + (p - base) / rate. Frames before start are stale
+  // (written before a reset). Written by the producer, read by the audio
+  // thread without locks (sequence counter, odd while being written).
+  struct Timeline {
+    uint64_t start;
+    uint64_t base;
+    double origin;
+  };
+  void set_timeline(const Timeline& timeline);
+  Timeline timeline() const;
+
   static OSStatus render_callback(void* context, AudioUnitRenderActionFlags* flags,
                                   const AudioTimeStamp* time, UInt32 bus, UInt32 frames,
                                   AudioBufferList* data);
   void render(const AudioTimeStamp* time, UInt32 frames, float* out);
-  void drop_front(size_t frames);
-  size_t copy_front(float* out, size_t frames);
+  void copy_out(uint64_t from, float* out, size_t frames) const;
 
   const int rate_;
   const int channels_;
@@ -95,17 +109,22 @@ class AudioOutput {
   std::atomic<float> volume_{1.f};
   std::atomic<double> latency_{0};
   std::atomic<bool> closed_{false};
+  std::atomic<bool> ended_{false};
 
-  // Ring buffer of interleaved samples whose first frame plays at head_time_.
-  // The audio thread only try-locks, so it never waits on the decoder.
-  mutable std::mutex mu_;
+  // Single-producer, single-consumer ring of interleaved samples. Positions
+  // count frames since the start and only grow; the audio thread never
+  // waits for the decoder, and the decoder only waits when the ring is full.
   std::vector<float> ring_;
-  size_t capacity_ = 0;  // frames
-  size_t read_ = 0;      // frame index of the head
-  size_t count_ = 0;     // frames buffered
-  double head_time_ = 0;
+  uint64_t capacity_ = 0;  // frames
+  std::atomic<uint64_t> write_pos_{0};  // producer
+  std::atomic<uint64_t> read_pos_{0};   // audio thread
+  std::atomic<uint64_t> timeline_seq_{0};
+  std::atomic<uint64_t> timeline_start_{0};
+  std::atomic<uint64_t> timeline_base_{0};
+  std::atomic<double> timeline_origin_{0};
+  Timeline producer_timeline_{};  // the producer's own copy
 
-  // Audio thread state and stats (stats read under mu_).
+  // Audio thread only.
   uint64_t generation_ = UINT64_MAX;
   int settle_buffers_ = 0;
   int64_t underruns_ = 0;

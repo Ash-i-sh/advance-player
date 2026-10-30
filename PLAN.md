@@ -275,9 +275,11 @@ kept as a possible later addition for other apps' video.
   mean 0.01–0.05 ms, max under 0.1 ms after start-up, no underruns, through
   scripted pause, seek, mute and volume changes. Not measurable here: the
   real acoustic offset (needs ears or a microphone; a flash-and-beep clip is
-  in the README) and display latency, which is not allowed for. The audio
-  thread only try-locks the buffer; a lock-free ring would remove the rare
-  skipped buffer.
+  in the README) and display latency, which is not allowed for. The buffer
+  between decoder and audio thread is a lock-free single-producer ring: a
+  first version with a try-lock skipped a 10 ms buffer now and then (one
+  resync in some 20 s runs); since the change, 0 in 8 runs. Owner checked
+  the flash-and-beep clip by ear and eye: in sync on the built-in output.
 - Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
   Free disk space (~10 GB) must be raised first.
 - Next without Xcode: yt-dlp link spike, subtitles and audio-track choice,

@@ -177,20 +177,43 @@ void AudioOutput::update_latency() {
   latency_ = frames / device_rate + unit_latency;
 }
 
+void AudioOutput::set_timeline(const Timeline& timeline) {
+  timeline_seq_.fetch_add(1, std::memory_order_acq_rel);
+  timeline_start_.store(timeline.start, std::memory_order_relaxed);
+  timeline_base_.store(timeline.base, std::memory_order_relaxed);
+  timeline_origin_.store(timeline.origin, std::memory_order_relaxed);
+  timeline_seq_.fetch_add(1, std::memory_order_release);
+  producer_timeline_ = timeline;
+}
+
+AudioOutput::Timeline AudioOutput::timeline() const {
+  return Timeline{timeline_start_.load(std::memory_order_relaxed),
+                  timeline_base_.load(std::memory_order_relaxed),
+                  timeline_origin_.load(std::memory_order_relaxed)};
+}
+
 void AudioOutput::push(const float* samples, int frames, double time,
                        const std::function<bool()>& give_up) {
-  std::unique_lock<std::mutex> lock(mu_);
-  if (count_ == 0) {
-    head_time_ = time;
+  uint64_t write = write_pos_.load(std::memory_order_relaxed);
+  const auto used = [&] {
+    return write - std::max(read_pos_.load(std::memory_order_acquire), producer_timeline_.start);
+  };
+  if (used() == 0) {
+    // Nothing buffered: this chunk starts a new stretch of the timeline.
+    set_timeline(Timeline{write, write, time});
   } else {
-    const double gap = time - (head_time_ + static_cast<double>(count_) / rate_);
+    const Timeline& tl = producer_timeline_;
+    const double end = tl.origin + static_cast<double>(write - tl.base) / rate_;
+    const double gap = time - end;
     if (gap > kGapSeconds) {
       // Missing audio (damaged or sparse stream): keep the timeline with silence.
-      size_t silence = std::min(capacity_ - count_, static_cast<size_t>(std::llround(gap * rate_)));
-      for (; silence > 0; --silence) {
-        std::fill_n(&ring_[((read_ + count_) % capacity_) * channels_], channels_, 0.f);
-        ++count_;
+      const uint64_t silence =
+          std::min<uint64_t>(capacity_ - used(), static_cast<uint64_t>(std::llround(gap * rate_)));
+      for (uint64_t i = 0; i < silence; ++i) {
+        std::fill_n(&ring_[((write + i) % capacity_) * channels_], channels_, 0.f);
       }
+      write += silence;
+      write_pos_.store(write, std::memory_order_release);
     } else if (gap < -kGapSeconds) {
       const int skip = static_cast<int>(std::llround(-gap * rate_));
       if (skip >= frames) return;
@@ -199,37 +222,38 @@ void AudioOutput::push(const float* samples, int frames, double time,
     }
   }
   while (frames > 0) {
-    if (count_ == capacity_) {
-      // Full: playback is far behind the decoder (paused). Wait for room.
-      lock.unlock();
+    const uint64_t room = capacity_ - used();
+    if (room == 0) {
+      // Full: playback is far behind the decoder. Wait for room.
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
       if (closed_ || give_up()) return;
-      lock.lock();
-      if (count_ == 0) return;  // reset meanwhile; this audio is stale
       continue;
     }
-    const size_t at = (read_ + count_) % capacity_;
-    const size_t n = std::min({static_cast<size_t>(frames), capacity_ - count_, capacity_ - at});
+    const uint64_t at = write % capacity_;
+    const uint64_t n = std::min<uint64_t>({static_cast<uint64_t>(frames), room, capacity_ - at});
     std::memcpy(&ring_[at * channels_], samples, n * channels_ * sizeof(float));
-    count_ += n;
+    write += n;
+    write_pos_.store(write, std::memory_order_release);
     samples += n * channels_;
     frames -= static_cast<int>(n);
   }
 }
 
 void AudioOutput::reset() {
-  std::lock_guard<std::mutex> lock(mu_);
-  read_ = 0;
-  count_ = 0;
+  // Everything written so far is stale; the next push starts a new timeline.
+  const uint64_t write = write_pos_.load(std::memory_order_relaxed);
+  set_timeline(Timeline{write, write, 0});
+  ended_ = false;
 }
 
 double AudioOutput::buffered() const {
-  std::lock_guard<std::mutex> lock(mu_);
-  return static_cast<double>(count_) / rate_;
+  const uint64_t write = write_pos_.load(std::memory_order_relaxed);
+  const uint64_t read =
+      std::max(read_pos_.load(std::memory_order_acquire), producer_timeline_.start);
+  return write > read ? static_cast<double>(write - read) / rate_ : 0.0;
 }
 
 AudioOutputStats AudioOutput::stats() const {
-  std::lock_guard<std::mutex> lock(mu_);
   AudioOutputStats s;
   s.underruns = underruns_;
   s.resyncs = resyncs_;
@@ -248,48 +272,57 @@ OSStatus AudioOutput::render_callback(void* context, AudioUnitRenderActionFlags*
   return noErr;
 }
 
-void AudioOutput::drop_front(size_t frames) {
-  frames = std::min(frames, count_);
-  read_ = (read_ + frames) % capacity_;
-  count_ -= frames;
-  head_time_ += static_cast<double>(frames) / rate_;
-}
-
-size_t AudioOutput::copy_front(float* out, size_t frames) {
-  frames = std::min(frames, count_);
+void AudioOutput::copy_out(uint64_t from, float* out, size_t frames) const {
   for (size_t done = 0; done < frames;) {
-    const size_t n = std::min(frames - done, capacity_ - read_);
-    std::memcpy(out + done * channels_, &ring_[read_ * channels_], n * channels_ * sizeof(float));
-    read_ = (read_ + n) % capacity_;
+    const uint64_t at = (from + done) % capacity_;
+    const size_t n = std::min<size_t>(frames - done, capacity_ - at);
+    std::memcpy(out + done * channels_, &ring_[at * channels_], n * channels_ * sizeof(float));
     done += n;
   }
-  count_ -= frames;
-  head_time_ += static_cast<double>(frames) / rate_;
-  return frames;
 }
 
-// Runs on Core Audio's real-time thread: no waiting, no allocation. out is
-// already silent; anything not filled stays so.
+// Runs on Core Audio's real-time thread: no locks, no waiting, no
+// allocation. out is already silent; anything not filled stays so.
 void AudioOutput::render(const AudioTimeStamp* time, UInt32 frames, float* out) {
   if (!(time->mFlags & kAudioTimeStampHostTimeValid)) return;
   uint64_t generation = 0;
   const std::optional<double> media =
       clock_.at(host_seconds(time->mHostTime) + latency_.load(), &generation);
   if (!media) return;  // paused or not started
-  std::unique_lock<std::mutex> lock(mu_, std::try_to_lock);
-  if (!lock.owns_lock()) return;  // the decoder holds it for a moment
-
   if (generation != generation_) {
     generation_ = generation;
     settle_buffers_ = kSettleBuffers;
   }
-  if (count_ == 0) {
-    if (settle_buffers_ == 0) ++underruns_;
+
+  // The timeline changes only on a reset or a fresh start, when there is
+  // nothing worth playing; if it changes under us, this buffer stays silent.
+  const uint64_t seq = timeline_seq_.load(std::memory_order_acquire);
+  if (seq & 1) return;
+  const Timeline tl = timeline();
+  const uint64_t write = write_pos_.load(std::memory_order_acquire);
+  uint64_t read = std::max(read_pos_.load(std::memory_order_relaxed), tl.start);
+  uint64_t available = write > read ? write - read : 0;
+  const auto finish = [&](uint64_t new_read) {
+    if (timeline_seq_.load(std::memory_order_acquire) != seq) {
+      std::fill_n(out, static_cast<size_t>(frames) * channels_, 0.f);
+      return;
+    }
+    read_pos_.store(new_read, std::memory_order_release);
+  };
+  if (available == 0) {
+    if (settle_buffers_ == 0 && !ended_) ++underruns_;
+    finish(read);
     return;
   }
+  const auto drop = [&](uint64_t n) {
+    n = std::min(n, available);
+    read += n;
+    available -= n;
+  };
 
   size_t filled = 0;
-  const double error = head_time_ - *media;  // > 0: the buffered audio is for later
+  const double head_time = tl.origin + static_cast<double>(static_cast<int64_t>(read - tl.base)) / rate_;
+  const double error = head_time - *media;  // > 0: the buffered audio is for later
   // Line up exactly on the first buffer after a (re)start; later, only a
   // large error is fixed at once.
   const bool restart = settle_buffers_ == kSettleBuffers;
@@ -297,7 +330,7 @@ void AudioOutput::render(const AudioTimeStamp* time, UInt32 frames, float* out) 
     if (settle_buffers_ == 0) ++resyncs_;
     settle_buffers_ = kSettleBuffers;
     if (error < 0) {
-      drop_front(static_cast<size_t>(std::llround(-error * rate_)));
+      drop(static_cast<uint64_t>(std::llround(-error * rate_)));
     } else {
       filled = std::min<size_t>(frames, static_cast<size_t>(std::llround(error * rate_)));
     }
@@ -309,20 +342,24 @@ void AudioOutput::render(const AudioTimeStamp* time, UInt32 frames, float* out) 
       sync_max_ = std::max(sync_max_, std::fabs(error));
       ++sync_count_;
     }
-    if (error < -kSlackSeconds && count_ > 1) {
-      drop_front(1);
-    } else if (error > kSlackSeconds) {
-      std::memcpy(out, &ring_[read_ * channels_], channels_ * sizeof(float));  // repeat one
+    if (error < -kSlackSeconds && available > 1) {
+      drop(1);
+    } else if (error > kSlackSeconds && available > 0) {
+      copy_out(read, out, 1);  // play the next frame twice
       filled = 1;
     }
   }
   const size_t want = frames - filled;
-  if (copy_front(out + filled * channels_, want) < want && settle_buffers_ == 0) ++underruns_;
+  const size_t got = static_cast<size_t>(std::min<uint64_t>(want, available));
+  copy_out(read, out + filled * channels_, got);
+  read += got;
+  if (got < want && settle_buffers_ == 0 && !ended_) ++underruns_;
 
   const float volume = volume_.load();
   if (volume != 1.f) {
     for (size_t i = 0, n = static_cast<size_t>(frames) * channels_; i < n; ++i) out[i] *= volume;
   }
+  finish(read);
 }
 
 }  // namespace advp

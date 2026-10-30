@@ -523,6 +523,7 @@ class Player {
         if (seek_request_) continue;  // stale: a seek arrived while decoding
         if (!got) {
           schedule_.end();
+          if (audio_out_) audio_out_->end();
         } else if (decoded.time >= discard_before) {
           schedule_.push(std::move(decoded.frame), decoded.time);
           hardware_ = decoder_->hardware();
