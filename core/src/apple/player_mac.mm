@@ -4,6 +4,7 @@
 // the schedule for the source pair around it, interpolate on the GPU and
 // present the result exactly at that refresh. Metal reports when each frame
 // actually reached the screen, which is what the pacing numbers are built on.
+// Audio follows the same clock (audio_output.h).
 
 #import <AppKit/AppKit.h>
 #import <ImageIO/ImageIO.h>
@@ -32,6 +33,8 @@
 #include "advp/rate.h"
 #include "advp/schedule.h"
 #include "advp_shaders.h"
+#include "apple/audio_output.h"
+#include "audio_decoder.h"
 #include "video_decoder.h"
 
 extern "C" {
@@ -89,6 +92,11 @@ namespace advp {
 namespace {
 
 constexpr size_t kQueuedFrames = 8;   // decoded source frames held ahead
+// Files interleave audio and video loosely, so while audio runs low the
+// decoder may read further ahead in video to reach it.
+constexpr size_t kMaxQueuedFrames = 24;
+constexpr double kAudioLowSeconds = 0.5;
+constexpr float kVolumeStep = 0.1f;
 constexpr double kBudgetShare = 0.5;  // part of each refresh smoothing may use
 constexpr double kSeekStep = 10.0;
 constexpr double kWarmupSeconds = 0.5;
@@ -99,14 +107,6 @@ struct PresentParams {
   simd_float4 matrix;
 };
 
-double host_seconds(uint64_t host_time) {
-  static const double scale = [] {
-    mach_timebase_info_data_t info;
-    mach_timebase_info(&info);
-    return static_cast<double>(info.numer) / info.denom / 1e9;
-  }();
-  return host_time * scale;
-}
 
 double now_ms() {
   return std::chrono::duration<double, std::milli>(
@@ -197,7 +197,10 @@ class Player {
 
  public:
   Player(GpuBackend& backend, const PlayOptions& options)
-      : backend_(backend), opt_(options), stats_(std::make_shared<PresentStats>()) {}
+      : backend_(backend),
+        opt_(options),
+        volume_(std::clamp(options.volume, 0.f, 1.f)),
+        stats_(std::make_shared<PresentStats>()) {}
 
   ~Player() {
     if (link_ || decode_thread_.joinable()) shutdown();
@@ -215,6 +218,7 @@ class Player {
     const AVRational sar = par->sample_aspect_ratio;
     aspect_ = static_cast<double>(par->width) / par->height *
               (sar.num > 0 && sar.den > 0 ? av_q2d(sar) : 1.0);
+    open_audio();
 
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -225,11 +229,13 @@ class Player {
     choose_engines();
 
     decode_thread_ = std::thread([this] { decode_loop(); });
+    if (audio_out_) audio_out_->start();
     CVDisplayLinkStart(link_);
 
     NSTimer* title_timer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                            repeats:YES
                                                              block:^(NSTimer*) {
+                                                               if (audio_out_) audio_out_->update_latency();
                                                                update_title();
                                                              }];
     NSTimer* limit_timer = nil;
@@ -240,11 +246,21 @@ class Player {
                                                         request_stop();
                                                       }];
     }
+    NSMutableArray<NSTimer*>* action_timers = [NSMutableArray array];
+    for (const PlayAction& action : opt_.actions) {
+      const std::string command = action.command;
+      [action_timers addObject:[NSTimer scheduledTimerWithTimeInterval:action.at
+                                                               repeats:NO
+                                                                 block:^(NSTimer*) {
+                                                                   run_command(command);
+                                                                 }]];
+    }
     [NSApp activateIgnoringOtherApps:YES];
     [NSApp run];
 
     [title_timer invalidate];
     [limit_timer invalidate];
+    for (NSTimer* timer in action_timers) [timer invalidate];
     shutdown();
     result_.seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -254,6 +270,33 @@ class Player {
 
  private:
   // ---- setup ---------------------------------------------------------------
+
+  // The file's main audio stream, if any. Without a usable output device the
+  // video still plays, and the result says why there is no sound.
+  void open_audio() {
+    if (opt_.no_audio) {
+      result_.audio = "off";
+      return;
+    }
+    AVFormatContext* format = decoder_->format();
+    const int index = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1,
+                                          decoder_->video_index(), nullptr, 0);
+    if (index < 0) {
+      result_.audio = "none in file";
+      return;
+    }
+    try {
+      audio_decoder_ = std::make_unique<AudioDecoder>(format->streams[index]);
+      audio_out_ = std::make_unique<AudioOutput>(audio_decoder_->sample_rate(),
+                                                 AudioDecoder::channels(), clock_);
+      audio_out_->set_volume(volume_);
+      result_.audio = audio_decoder_->description();
+    } catch (const std::exception& e) {
+      audio_out_.reset();
+      audio_decoder_.reset();
+      result_.audio = std::string("unavailable (") + e.what() + ")";
+    }
+  }
 
   void setup_metal() {
     device_ = MTLCreateSystemDefaultDevice();
@@ -431,18 +474,36 @@ class Player {
         decoder_->seek(opt_.start);
         discard_before = opt_.start - step / 2;
       }
+      // Audio packets arrive while reading video; decode them on the way.
+      const auto on_other = [&](AVPacket* packet) {
+        if (!audio_decoder_ || packet->stream_index != audio_decoder_->stream_index()) return;
+        audio_decoder_->decode(packet, [&](const AudioChunk& chunk) {
+          const double end = chunk.time + static_cast<double>(chunk.frames) / audio_decoder_->sample_rate();
+          if (end < discard_before) return;  // before the start or seek point
+          audio_out_->push(chunk.samples, chunk.frames, chunk.time,
+                           [this] { return stop_ || seek_pending_; });
+        });
+      };
+      const auto wants_more = [&] {
+        if (schedule_.ended()) return false;
+        if (schedule_.size() < kQueuedFrames) return true;
+        return audio_out_ && schedule_.size() < kMaxQueuedFrames &&
+               audio_out_->buffered() < kAudioLowSeconds;
+      };
       DecodedFrame decoded;
       while (!stop_) {
         std::optional<double> seek_to;
         {
           std::unique_lock<std::mutex> lock(mu_);
-          cv_.wait(lock, [&] {
-            return stop_ || seek_request_ || (!schedule_.ended() && schedule_.size() < kQueuedFrames);
-          });
+          // Timed, because audio drains without notifying.
+          while (!(stop_ || seek_request_ || wants_more())) {
+            cv_.wait_for(lock, std::chrono::milliseconds(20));
+          }
           if (stop_) break;
           if (seek_request_) {
             seek_to = seek_request_;
             seek_request_.reset();
+            seek_pending_ = false;
             schedule_.clear();
             clock_running_ = false;
             restart_media_.reset();
@@ -450,10 +511,14 @@ class Player {
         }
         if (seek_to) {
           decoder_->seek(*seek_to);
+          if (audio_decoder_) {
+            audio_decoder_->flush();
+            audio_out_->reset();
+          }
           discard_before = *seek_to - step / 2;
           continue;
         }
-        const bool got = decoder_->next(decoded);
+        const bool got = decoder_->next(decoded, on_other);
         std::lock_guard<std::mutex> lock(mu_);
         if (seek_request_) continue;  // stale: a seek arrived while decoding
         if (!got) {
@@ -517,6 +582,7 @@ class Player {
           origin_media_ = restart_media_.value_or(schedule_.first_time());
           restart_media_.reset();
           ++generation_;
+          clock_.run(origin_host_, origin_media_);
         }
       }
       if (!clock_running_ && !paused_) return;
@@ -852,17 +918,39 @@ class Player {
   void handle_key(NSEvent* event) {
     const unsigned short code = event.keyCode;
     NSString* chars = event.charactersIgnoringModifiers.lowercaseString;
-    if (code == 53 || [chars isEqualToString:@"q"]) {
+    const char* command = nullptr;
+    if (code == 53 || [chars isEqualToString:@"q"]) command = "quit";
+    else if ([chars isEqualToString:@" "]) command = "pause";
+    else if ([chars isEqualToString:@"s"]) command = "smoothing";
+    else if ([chars isEqualToString:@"f"]) command = "fullscreen";
+    else if ([chars isEqualToString:@"m"]) command = "mute";
+    else if (code == 123) command = "back";
+    else if (code == 124) command = "forward";
+    else if (code == 126) command = "louder";
+    else if (code == 125) command = "quieter";
+    if (command) run_command(command);
+  }
+
+  // Player controls, from keys or from PlayOptions::actions.
+  void run_command(const std::string& command) {
+    if (command == "quit") {
       request_stop();
-    } else if ([chars isEqualToString:@" "]) {
+    } else if (command == "pause") {
       toggle_pause();
-    } else if ([chars isEqualToString:@"s"]) {
+    } else if (command == "smoothing") {
       smoothing_ = !smoothing_;
-    } else if ([chars isEqualToString:@"f"]) {
+    } else if (command == "fullscreen") {
       [window_ toggleFullScreen:nil];
-    } else if (code == 123 || code == 124) {
-      seek_by(code == 123 ? -kSeekStep : kSeekStep);
+    } else if (command == "back" || command == "forward") {
+      seek_by(command == "back" ? -kSeekStep : kSeekStep);
+    } else if (command == "mute") {
+      muted_ = !muted_;
+    } else if (command == "louder" || command == "quieter") {
+      const float step = command == "louder" ? kVolumeStep : -kVolumeStep;
+      volume_ = std::clamp(volume_ + step, 0.f, 1.f);
+      muted_ = false;
     }
+    if (audio_out_) audio_out_->set_volume(muted_ ? 0.f : volume_);
     update_title();
   }
 
@@ -875,6 +963,7 @@ class Player {
     } else if (clock_running_) {
       paused_ = true;
       paused_media_ = current_media_;
+      clock_.stop();
     }
   }
 
@@ -884,7 +973,13 @@ class Player {
       double target = std::max(0.0, current_media_ + delta);
       if (decoder_->duration() > 1) target = std::min(target, decoder_->duration() - 1);
       seek_request_ = target;
+      seek_pending_ = true;  // lets a decoder blocked on full audio give up
       paused_ = false;
+      // Hold the picture until the decoder has frames from the new position.
+      schedule_.clear();
+      clock_running_ = false;
+      restart_media_.reset();
+      clock_.stop();
     }
     cv_.notify_all();
   }
@@ -906,11 +1001,12 @@ class Player {
     }
     NSString* name = [@(opt_.input.c_str()) lastPathComponent];
     window_.title = [NSString
-        stringWithFormat:@"%@ — %s%s · %.3f → %.2f fps on %.0f Hz · GPU %.1f ms · missed %lld · %.0f s%s",
+        stringWithFormat:@"%@ — %s%s · %.3f → %.2f fps on %.0f Hz · GPU %.1f ms · missed %lld · %.0f s%s%s",
                          name, smoothing_ ? engine.c_str() : "off",
                          smoothing_ ? "" : " (S)", result_.source_fps,
                          output_fps_ > 0 ? output_fps_ : display_hz_.load(),
                          display_hz_.load(), recent_work_ms_.load(), static_cast<long long>(missed), media,
+                         audio_out_ ? (muted_ ? " · muted" : [NSString stringWithFormat:@" · vol %.0f%%", volume_ * 100].UTF8String) : "",
                          paused ? " · paused" : ""];
   }
 
@@ -938,6 +1034,7 @@ class Player {
   void shutdown() {
     stop_ = true;
     cv_.notify_all();
+    if (audio_out_) audio_out_->stop();  // also frees a decoder blocked on it
     if (link_) {
       CVDisplayLinkStop(link_);
       while (in_callback_) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -969,6 +1066,14 @@ class Player {
     result_.refreshes = refreshes_;
     result_.interpolated = interpolated_;
     result_.underflows = underflows_;
+    if (audio_out_) {
+      const AudioOutputStats a = audio_out_->stats();
+      result_.audio_latency_ms = audio_out_->latency() * 1000.0;
+      result_.audio_underruns = a.underruns;
+      result_.audio_resyncs = a.resyncs;
+      result_.audio_sync_ms_mean = a.sync_ms_mean;
+      result_.audio_sync_ms_max = a.sync_ms_max;
+    }
 
     if (!work_ms_.empty()) {
       std::vector<double> w = work_ms_;
@@ -994,6 +1099,12 @@ class Player {
   PlayOptions opt_;
   PlayResult result_;
   std::unique_ptr<VideoDecoder> decoder_;
+  // Audio; null when the file has none or there is no output device.
+  MediaClock clock_;
+  std::unique_ptr<AudioDecoder> audio_decoder_;
+  std::unique_ptr<AudioOutput> audio_out_;
+  float volume_ = 1.f;  // main thread
+  bool muted_ = false;
   double aspect_ = 16.0 / 9.0;
   bool high_bit_depth_ = false;
 
@@ -1027,6 +1138,7 @@ class Player {
   bool hardware_ = false;
 
   std::atomic<bool> stop_{false};
+  std::atomic<bool> seek_pending_{false};
   std::atomic<bool> in_callback_{false};
   std::atomic<bool> smoothing_{true};
   std::atomic<double> recent_work_ms_{0};

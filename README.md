@@ -19,9 +19,10 @@ Milestone M0 (engine foundation), macOS:
   hardware encode, audio and subtitles kept, 8-bit and 10-bit.
 - `advp play`: test player window. Smooths live to the display's refresh rate,
   presents each frame on its exact refresh and reports measured pacing.
-  Video only for now.
+  Audio plays in sync: the picture's clock leads and audio follows it,
+  allowing for the output device's latency (stereo; surround is downmixed).
 
-Not yet: audio in the player, the real UI (Flutter, needs Xcode), Apple's
+Not yet: subtitles and track choice in the player, the real UI (Flutter, needs Xcode), Apple's
 VideoToolbox frame-rate conversion (needs macOS 15.4+ and its SDK), AI
 engines, colour pipeline, network and link playback.
 
@@ -72,9 +73,23 @@ build/advp play movie.mkv
 ```
 
 Player keys: space pause, ←/→ seek 10 s, S smoothing on/off (before/after),
-F full screen, Q or Esc quit. `--engine off|blend|motion-fast|motion` fixes the
-engine; `--seconds N` stops after N seconds and prints pacing stats;
-`--screenshot frame.png` saves one smoothed frame as displayed.
+M mute, ↑/↓ volume, F full screen, Q or Esc quit.
+`--engine off|blend|motion-fast|motion` fixes the engine; `--seconds N` stops
+after N seconds and prints pacing and audio sync stats; `--screenshot
+frame.png` saves one smoothed frame as displayed; `--volume 0-100` and
+`--no-audio` set the sound; `--actions 2:pause,4:pause,6:forward` presses
+controls at set times (for scripted tests).
+
+To check lip sync by eye and ear, make a clip with a one-frame white flash
+and a short beep every second; they should land together:
+
+```bash
+tools/ff ffmpeg -f lavfi -i "color=c=black:s=1280x720:r=24,drawbox=c=white:t=fill:enable='lt(mod(t\,1)\,1/24)'" -f lavfi -i "sine=f=1000:r=48000,volume=volume=0:enable='gte(mod(t\,1)\,0.042)'" -t 30 -c:v h264_videotoolbox -c:a aac samples/av_sync_check.mp4
+```
+
+```bash
+build/advp play samples/av_sync_check.mp4 --engine off
+```
 
 Output rate (`--fps`):
 

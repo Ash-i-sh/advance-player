@@ -260,11 +260,29 @@ kept as a possible later addition for other apps' video.
   coloured light sweeping across a still logo (frame 13 of the trailer, 16 dB
   under blend), and cuts from a dark shot to a bright one. Speed: no slower than
   before in an A/B run, but absolute timings again under screen-sharing load.
+- Audio in the player (M1 start, 2026-10-30): one demux pass feeds both
+  decoders; audio is decoded to float stereo (surround downmixed) and played
+  through Core Audio's default output, which follows the system's device.
+  The video clock stays the master, because it is tied to display refreshes
+  and keeps frame pacing exact; audio follows it, as mpv's smoothest mode
+  does. Each output buffer is placed by its host time plus the device's
+  latency (latency + I/O buffer + safety offset, as mpv counts it, plus the
+  unit's own rate conversion). Clock drift is removed one sample per buffer;
+  errors over 5 ms (start, seek, resume, a skipped buffer) are fixed at once.
+  While audio runs low the decoder may read up to 24 video frames ahead, for
+  loosely interleaved files.
+  Measured against the video clock (Opus, AAC, 5.1 AC-3, 44.1 kHz FLAC):
+  mean 0.01–0.05 ms, max under 0.1 ms after start-up, no underruns, through
+  scripted pause, seek, mute and volume changes. Not measurable here: the
+  real acoustic offset (needs ears or a microphone; a flash-and-beep clip is
+  in the README) and display latency, which is not allowed for. The audio
+  thread only try-locks the buffer; a lock-free ring would remove the rare
+  skipped buffer.
 - Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
   Free disk space (~10 GB) must be raised first.
-- Next without Xcode: audio and A/V sync in the test player, yt-dlp link
-  spike, temporal vector prediction (steadier vectors between pairs), cheaper
-  4K motion.
+- Next without Xcode: yt-dlp link spike, subtitles and audio-track choice,
+  temporal vector prediction (steadier vectors between pairs), cheaper 4K
+  motion.
 
 Keeping Windows cheap later: platform-specific code sits behind interfaces from
 day one, and a Windows CI job compiles the shared core on every change so it

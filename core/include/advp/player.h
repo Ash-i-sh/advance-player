@@ -3,16 +3,25 @@
 //
 // This is the test player for the frame-pacing spike (PLAN.md §8, M0). It
 // measures what reaches the screen, so engine choices can be checked against
-// real presentation timing rather than benchmarks alone. Video only for now;
-// audio and A/V sync arrive with the player core (M1).
+// real presentation timing rather than benchmarks alone. Audio plays in sync
+// with the picture; the video clock leads and audio follows it.
 #pragma once
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "advp/engine.h"
 
 namespace advp {
+
+// A control run at a set time after start, as if its key were pressed:
+// "pause", "back", "forward", "smoothing", "mute", "louder", "quieter",
+// "fullscreen", "quit". For scripted tests of the controls.
+struct PlayAction {
+  double at = 0;  // seconds after the window opens
+  std::string command;
+};
 
 struct PlayOptions {
   std::string input;
@@ -31,6 +40,9 @@ struct PlayOptions {
   // Saves one smoothed frame, exactly as displayed, to this PNG path.
   std::string screenshot;
   double screenshot_after = 1.0;  // seconds of playback first
+  bool no_audio = false;
+  float volume = 1.f;  // 0..1
+  std::vector<PlayAction> actions;
 };
 
 struct PlayResult {
@@ -58,6 +70,13 @@ struct PlayResult {
   double work_ms_p99 = 0;
   double work_ms_max = 0;
   double interval_jitter_ms = 0;  // RMS error of frame timing vs. its schedule
+
+  std::string audio;  // stream description, or why there is none
+  double audio_latency_ms = 0;  // output device latency allowed for
+  int64_t audio_underruns = 0;  // buffers that ran out of decoded audio
+  int64_t audio_resyncs = 0;    // large corrections once playing had settled
+  double audio_sync_ms_mean = 0;  // audio vs. video clock while settled
+  double audio_sync_ms_max = 0;
   double seconds = 0;
 };
 
@@ -65,7 +84,7 @@ struct PlayResult {
 // closed. Must be called on the main thread.
 //
 // Keys: space pause, left/right seek 10 s, S smoothing on/off (before/after),
-// F full screen, Q or Esc quit.
+// M mute, up/down volume, F full screen, Q or Esc quit.
 PlayResult play_file(GpuBackend& backend, const PlayOptions& options);
 
 }  // namespace advp
