@@ -192,6 +192,22 @@ void test_schedule_edges() {
   expect(p.a == b, "after a gap the later frame shows");
 }
 
+// The decoder frees frames the clock has passed while the display is stuck.
+void test_schedule_release_before() {
+  advp::FrameSchedule s;
+  std::vector<std::shared_ptr<FakeFrame>> frames;
+  for (int i = 0; i < 10; ++i) {
+    frames.push_back(std::make_shared<FakeFrame>());
+    s.push(frames.back(), i / 24.0);
+  }
+  s.release_before(4.5 / 24);
+  expect(s.size() == 6 && s.first_time() == 4 / 24.0, "frames before the current one released");
+  const auto p = s.at(4.5 / 24);
+  expect(p.a == frames[4] && p.b == frames[5], "the current pair is kept");
+  s.release_before(100);
+  expect(s.size() == 1, "the last frame is always kept");
+}
+
 int main() {
   test_24_to_60();
   test_integer_ratio();
@@ -203,6 +219,7 @@ int main() {
   test_select_engine();
   test_schedule_24_on_60hz();
   test_schedule_edges();
+  test_schedule_release_before();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

@@ -42,6 +42,10 @@ class FrameSchedule {
 
   // The pair for playback time `time`. Frames no longer needed are released.
   ScheduledPair at(double time);
+  // Releases frames that playback time `time` has passed, as at() would,
+  // without choosing a pair. Lets the decoder make room while the display is
+  // held up, instead of stopping (and starving audio read from the same file).
+  void release_before(double time);
 
  private:
   struct Entry {

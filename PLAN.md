@@ -317,9 +317,16 @@ kept as a possible later addition for other apps' video.
   and Hindi text, wrapping; ASS with tags removed and forced breaks; an
   external .srt; scripted switching of both kinds, 6 runs, no crashes.
   Not done: ASS styling (needs libass), bitmap subtitles untested (no sample
-  file), subtitles for links. Open: about 1 run in 3 on the test clip shows
-  a few audio underruns, with or without switching; suspected to be the GPU
-  being held at 100% by a browser tab, not yet confirmed.
+  file), subtitles for links.
+- Audio gaps traced (2026-10-30): about 1 run in 13 had ~30 ms of silence.
+  Traces showed the display thread blocked ~1 s in one refresh: macOS waits
+  up to a second for a free screen buffer when the GPU is saturated (here by
+  a browser tab). Frames stopped being taken, the decoder hit its 24-frame
+  cap, and audio, read from the same file, ran dry. Fix: while the clock
+  runs, the decoder releases frames the clock has passed, so reading (and
+  audio) continues through a display stall. Unit-tested; the repeat runs
+  after the fix were cut short (no gap in those that finished), so the
+  rate after the fix is not measured yet.
 - Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
   Free disk space (~10 GB) must be raised first.
 - Next without Xcode:

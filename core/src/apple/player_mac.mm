@@ -577,8 +577,15 @@ class Player {
         std::optional<double> seek_to;
         {
           std::unique_lock<std::mutex> lock(mu_);
-          // Timed, because audio drains without notifying.
-          while (!(stop_ || seek_request_ || wants_more())) {
+          // Timed, because audio drains without notifying. If the display
+          // is held up (macOS can block it up to a second waiting for a
+          // screen buffer when the GPU is busy), frames the clock has passed
+          // are dropped here, so reading goes on and audio keeps flowing.
+          while (true) {
+            if (const auto now = clock_.at(host_seconds(mach_absolute_time()))) {
+              schedule_.release_before(*now);
+            }
+            if (stop_ || seek_request_ || wants_more()) break;
             cv_.wait_for(lock, std::chrono::milliseconds(20));
           }
           if (stop_) break;

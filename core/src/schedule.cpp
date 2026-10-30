@@ -20,6 +20,10 @@ void FrameSchedule::clear() {
   ended_ = false;
 }
 
+void FrameSchedule::release_before(double time) {
+  while (frames_.size() >= 2 && frames_[1].time <= time) frames_.pop_front();
+}
+
 ScheduledPair FrameSchedule::at(double time) {
   ScheduledPair p;
   if (frames_.empty()) {
@@ -27,7 +31,7 @@ ScheduledPair FrameSchedule::at(double time) {
     p.underflow = !ended_;
     return p;
   }
-  while (frames_.size() >= 2 && frames_[1].time <= time) frames_.pop_front();
+  release_before(time);
 
   const Entry& a = frames_.front();
   p.a = a.frame;
