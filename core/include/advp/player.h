@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -24,7 +25,13 @@ struct PlayAction {
 };
 
 struct PlayOptions {
-  std::string input;
+  std::string input;  // file or stream URL
+  // Separate audio input (web streams often send audio apart); empty: the
+  // input's own audio.
+  std::string audio_input;
+  // FFmpeg options for opening the inputs, e.g. {"headers", "..."} for HTTP.
+  std::map<std::string, std::string> input_options;
+  std::string title;  // window title; empty: the file name
   // "auto": benchmark, pick the best engine that fits, adapt at runtime.
   // An engine name or "off": fixed, for comparisons.
   std::string engine = "auto";

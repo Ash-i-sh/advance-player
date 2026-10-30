@@ -54,6 +54,13 @@ python3 -m venv .venv && .venv/bin/pip install cmake ninja
 .venv/bin/cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM=$PWD/.venv/bin/ninja && .venv/bin/cmake --build build
 ```
 
+For opening links: yt-dlp, plus Node.js (yt-dlp runs the sites' JavaScript
+with it). `advp` finds `.venv/bin/yt-dlp`; `ADVP_YTDLP` points elsewhere.
+
+```bash
+.venv/bin/pip install yt-dlp yt-dlp-ejs
+```
+
 ## Use
 
 ```bash
@@ -70,6 +77,16 @@ build/advp convert movie.mkv movie_60.mp4 --fps 60
 
 ```bash
 build/advp play movie.mkv
+```
+
+`advp play` also takes a video page address instead of a file. yt-dlp finds
+the streams behind it (separate picture and sound, in a codec this Mac
+decodes in hardware: AV1, then HEVC, then H.264; at most `--max-height`, 2160
+by default) and they play through the same pipeline: smoothing, audio sync,
+seeking. Ads are never requested.
+
+```bash
+build/advp play "https://www.youtube.com/watch?v=VIDEO_ID" --fps fit:60
 ```
 
 Player keys: space pause, ←/→ seek 10 s, S smoothing on/off (before/after),

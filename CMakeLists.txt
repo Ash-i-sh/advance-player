@@ -46,6 +46,7 @@ if(APPLE AND EXISTS "${ADVP_FFMPEG_DIR}/include/libavcodec/avcodec.h")
   add_library(advp_media STATIC
     core/src/video_decoder.cpp
     core/src/audio_decoder.cpp
+    core/src/link.cpp
     core/src/convert.cpp
     core/src/apple/metal_backend.mm
     core/src/apple/device_apple.mm

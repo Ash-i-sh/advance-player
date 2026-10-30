@@ -280,9 +280,31 @@ kept as a possible later addition for other apps' video.
   first version with a try-lock skipped a 10 ms buffer now and then (one
   resync in some 20 s runs); since the change, 0 in 8 runs. Owner checked
   the flash-and-beep clip by ear and eye: in sync on the built-in output.
+- Link playback spike (2026-10-30, M0 done): `advp play URL` runs yt-dlp
+  2026.10.26 (with yt-dlp-ejs and Node for YouTube's JavaScript) as a
+  separate program, no shell, and plays the streams it returns through our
+  pipeline. YouTube sends picture and sound apart: picture in a codec this
+  Mac decodes in hardware (AV1 4K here: 10 Mbit/s against VP9's 15.6, and
+  the M4 decodes it with the CPU nearly idle), sound as Opus (not the "-drc"
+  variants). The sound gets its own input and thread, so a slow network read
+  for it never holds up the picture; HTTP headers come from yt-dlp per stream.
+  Measured on a 2.5-minute 4K trailer: link to first frame ~5 s (~3 s of it
+  yt-dlp); FFmpeg reads the 4K AV1 stream at ~2.8x real time over this
+  connection (one HTTP connection per stream, no throttling seen in 60 s).
+  First runs stalled: 12–18 decoder underflows in 25 s with seeks, none for
+  the same file played locally. Two fixes: compressed packets are read up to
+  30 s / 96 MB ahead on their own thread (decoded frames stay at 8; 30 s of
+  decoded 4K would be ~9 GB), and playback starts or resumes after a seek
+  only with 1.5 s read ahead. Since then: 0 underflows in 3 runs, sound
+  within 0.07 ms of the picture, no audio underruns. A bad or unsupported
+  address fails with yt-dlp's own reason.
+  Not done: quality choice by measured bandwidth, live streams (HLS), long
+  videos (YouTube may cut long single-connection reads; yt-dlp downloads in
+  10 MB ranges), expiring stream URLs (~6 h) on long pauses, other sites,
+  Windows. Legal review still required before launch (§6).
 - Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
   Free disk space (~10 GB) must be raised first.
-- Next without Xcode: yt-dlp link spike, subtitles and audio-track choice,
+- Next without Xcode: subtitles and audio-track choice,
   temporal vector prediction (steadier vectors between pairs), cheaper 4K
   motion.
 

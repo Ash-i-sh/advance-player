@@ -96,6 +96,11 @@ constexpr size_t kQueuedFrames = 8;   // decoded source frames held ahead
 // decoder may read further ahead in video to reach it.
 constexpr size_t kMaxQueuedFrames = 24;
 constexpr double kAudioLowSeconds = 0.5;
+// A separate audio input is read this far ahead (network reads can stall).
+constexpr double kAudioAheadSeconds = 2.0;
+// Network input: video read ahead before playback starts or resumes after a
+// seek, so the first seconds do not stall while the stream catches up.
+constexpr double kNetworkStartSeconds = 1.5;
 constexpr float kVolumeStep = 0.1f;
 constexpr double kBudgetShare = 0.5;  // part of each refresh smoothing may use
 constexpr double kSeekStep = 10.0;
@@ -208,7 +213,8 @@ class Player {
 
   PlayResult run() {
     const auto started = std::chrono::steady_clock::now();
-    decoder_ = std::make_unique<VideoDecoder>(backend_, opt_.input);
+    network_ = opt_.input.find("://") != std::string::npos;
+    decoder_ = std::make_unique<VideoDecoder>(backend_, opt_.input, opt_.input_options, network_);
     const AVCodecParameters* par = decoder_->video_stream()->codecpar;
     result_.width = par->width;
     result_.height = par->height;
@@ -229,6 +235,7 @@ class Player {
     choose_engines();
 
     decode_thread_ = std::thread([this] { decode_loop(); });
+    if (audio_source_) audio_thread_ = std::thread([this] { audio_loop(); });
     if (audio_out_) audio_out_->start();
     CVDisplayLinkStart(link_);
 
@@ -276,6 +283,21 @@ class Player {
   void open_audio() {
     if (opt_.no_audio) {
       result_.audio = "off";
+      return;
+    }
+    if (!opt_.audio_input.empty()) {
+      try {
+        audio_source_ = std::make_unique<AudioSource>(opt_.audio_input, opt_.input_options);
+        audio_out_ = std::make_unique<AudioOutput>(audio_source_->decoder().sample_rate(),
+                                                   AudioDecoder::channels(), clock_);
+        audio_out_->set_volume(volume_);
+        result_.audio = audio_source_->decoder().description() + " (separate stream)";
+        if (opt_.start > 0) seek_audio(opt_.start);
+      } catch (const std::exception& e) {
+        audio_out_.reset();
+        audio_source_.reset();
+        result_.audio = std::string("unavailable (") + e.what() + ")";
+      }
       return;
     }
     AVFormatContext* format = decoder_->format();
@@ -523,7 +545,7 @@ class Player {
         if (seek_request_) continue;  // stale: a seek arrived while decoding
         if (!got) {
           schedule_.end();
-          if (audio_out_) audio_out_->end();
+          if (audio_decoder_) audio_out_->end();  // a separate input ends on its own
         } else if (decoded.time >= discard_before) {
           schedule_.push(std::move(decoded.frame), decoded.time);
           hardware_ = decoder_->hardware();
@@ -537,6 +559,52 @@ class Player {
       }
       request_stop();
     }
+  }
+
+  // ---- separate audio input (own thread) -------------------------------------
+
+  // Keeps kAudioAheadSeconds of audio buffered from the separate input. The
+  // only producer for audio_out_ in this mode, so seeks are carried out here.
+  void audio_loop() {
+    try {
+      const double rate = audio_source_->decoder().sample_rate();
+      uint64_t seen = 0;
+      bool ended = false;
+      double discard_before = -1e300;
+      const auto sink = [&](const AudioChunk& chunk) {
+        if (chunk.time + chunk.frames / rate < discard_before) return;
+        audio_out_->push(chunk.samples, chunk.frames, chunk.time,
+                         [&] { return stop_ || audio_seek_generation_ != seen; });
+      };
+      while (!stop_) {
+        const uint64_t generation = audio_seek_generation_;
+        if (generation != seen) {
+          seen = generation;
+          const double to = audio_seek_to_;
+          audio_source_->seek(to);
+          audio_out_->reset();
+          discard_before = to - 0.05;
+          ended = false;
+          continue;
+        }
+        if (ended || audio_out_->buffered() >= kAudioAheadSeconds) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          continue;
+        }
+        if (!audio_source_->read(sink)) {
+          ended = true;
+          audio_out_->end();
+        }
+      }
+    } catch (const std::exception& e) {
+      std::lock_guard<std::mutex> lock(mu_);
+      audio_error_ = e.what();  // the picture plays on without sound
+    }
+  }
+
+  void seek_audio(double to) {
+    audio_seek_to_ = to;
+    ++audio_seek_generation_;
   }
 
   // ---- display (display link thread) ----------------------------------------
@@ -576,8 +644,11 @@ class Player {
     {
       std::lock_guard<std::mutex> lock(mu_);
       if (!clock_running_ && !paused_) {
-        // Start (or restart after a seek) once the next frames are decoded.
-        if (schedule_.size() >= 2 || (schedule_.ended() && !schedule_.empty())) {
+        // Start (or restart after a seek) once the next frames are decoded
+        // and, for network input, enough is read ahead.
+        const bool buffered = !network_ || decoder_->read_ahead_done() ||
+                              decoder_->read_ahead_seconds() >= kNetworkStartSeconds;
+        if ((schedule_.size() >= 2 && buffered) || (schedule_.ended() && !schedule_.empty())) {
           clock_running_ = true;
           origin_host_ = present_at;
           origin_media_ = restart_media_.value_or(schedule_.first_time());
@@ -975,6 +1046,7 @@ class Player {
       if (decoder_->duration() > 1) target = std::min(target, decoder_->duration() - 1);
       seek_request_ = target;
       seek_pending_ = true;  // lets a decoder blocked on full audio give up
+      if (audio_source_) seek_audio(target);
       paused_ = false;
       // Hold the picture until the decoder has frames from the new position.
       schedule_.clear();
@@ -1000,7 +1072,8 @@ class Player {
       std::lock_guard<std::mutex> lock(stats_->mu);
       missed = stats_->missed;
     }
-    NSString* name = [@(opt_.input.c_str()) lastPathComponent];
+    NSString* name = opt_.title.empty() ? [@(opt_.input.c_str()) lastPathComponent]
+                                        : @(opt_.title.c_str());
     window_.title = [NSString
         stringWithFormat:@"%@ — %s%s · %.3f → %.2f fps on %.0f Hz · GPU %.1f ms · missed %lld · %.0f s%s%s",
                          name, smoothing_ ? engine.c_str() : "off",
@@ -1043,6 +1116,7 @@ class Player {
       link_ = nullptr;
     }
     if (decode_thread_.joinable()) decode_thread_.join();
+    if (audio_thread_.joinable()) audio_thread_.join();
     id<MTLCommandBuffer> idle = [queue_ commandBuffer];
     [idle commit];
     [idle waitUntilCompleted];
@@ -1067,6 +1141,7 @@ class Player {
     result_.refreshes = refreshes_;
     result_.interpolated = interpolated_;
     result_.underflows = underflows_;
+    if (!audio_error_.empty()) result_.audio += " — stopped: " + audio_error_;
     if (audio_out_) {
       const AudioOutputStats a = audio_out_->stats();
       result_.audio_latency_ms = audio_out_->latency() * 1000.0;
@@ -1102,12 +1177,17 @@ class Player {
   std::unique_ptr<VideoDecoder> decoder_;
   // Audio; null when the file has none or there is no output device.
   MediaClock clock_;
-  std::unique_ptr<AudioDecoder> audio_decoder_;
+  std::unique_ptr<AudioDecoder> audio_decoder_;  // audio inside the video input
+  std::unique_ptr<AudioSource> audio_source_;    // or a separate audio input
   std::unique_ptr<AudioOutput> audio_out_;
+  std::thread audio_thread_;
+  std::atomic<uint64_t> audio_seek_generation_{0};
+  std::atomic<double> audio_seek_to_{0};
   float volume_ = 1.f;  // main thread
   bool muted_ = false;
   double aspect_ = 16.0 / 9.0;
   bool high_bit_depth_ = false;
+  bool network_ = false;
 
   // Window and presentation.
   id<MTLDevice> device_ = nil;
@@ -1136,6 +1216,7 @@ class Player {
   uint64_t generation_ = 0;  // bumps on every clock restart; splits timing stats
   std::string engine_name_;
   std::string error_;
+  std::string audio_error_;
   bool hardware_ = false;
 
   std::atomic<bool> stop_{false};

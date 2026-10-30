@@ -1,12 +1,17 @@
 // Decodes one audio stream to interleaved 32-bit float stereo at the stream's
 // own sample rate (surround is downmixed). Packets come from the demuxer that
-// VideoDecoder owns, so audio and video are read in one pass.
+// VideoDecoder owns, so audio and video are read in one pass, or from an
+// AudioSource when the audio is a separate input.
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 
+#include "video_decoder.h"
+
 struct AVCodecContext;
+struct AVFormatContext;
 struct AVFrame;
 struct AVPacket;
 struct AVStream;
@@ -55,6 +60,27 @@ class AudioDecoder {
   bool have_time_ = false;
   float* out_ = nullptr;
   int out_capacity_ = 0;  // frames
+};
+
+// An audio-only input of its own: web streams often send audio and video
+// separately.
+class AudioSource {
+ public:
+  AudioSource(const std::string& path, const OpenOptions& options);
+  ~AudioSource();
+  AudioSource(const AudioSource&) = delete;
+  AudioSource& operator=(const AudioSource&) = delete;
+
+  AudioDecoder& decoder() { return *decoder_; }
+  // Reads and decodes the next packet; false at the end of the input.
+  bool read(const std::function<void(const AudioChunk&)>& sink);
+  // Jumps to just before seconds.
+  void seek(double seconds);
+
+ private:
+  AVFormatContext* format_ = nullptr;
+  AVPacket* packet_ = nullptr;
+  std::unique_ptr<AudioDecoder> decoder_;
 };
 
 }  // namespace advp

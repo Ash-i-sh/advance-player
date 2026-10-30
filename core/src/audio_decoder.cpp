@@ -96,4 +96,38 @@ void AudioDecoder::convert(AVFrame* frame, const std::function<void(const AudioC
   sink(AudioChunk{out_, frames, time});
 }
 
+AudioSource::AudioSource(const std::string& path, const OpenOptions& options) {
+  format_ = open_input(path, options);
+  try {
+    const int index = av_find_best_stream(format_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    check(index, "find audio stream");
+    decoder_ = std::make_unique<AudioDecoder>(format_->streams[index]);
+    packet_ = av_packet_alloc();
+  } catch (...) {
+    avformat_close_input(&format_);
+    throw;
+  }
+}
+
+AudioSource::~AudioSource() {
+  av_packet_free(&packet_);
+  avformat_close_input(&format_);
+}
+
+bool AudioSource::read(const std::function<void(const AudioChunk&)>& sink) {
+  while (true) {
+    if (av_read_frame(format_, packet_) < 0) return false;
+    const bool ours = packet_->stream_index == decoder_->stream_index();
+    if (ours) decoder_->decode(packet_, sink);
+    av_packet_unref(packet_);
+    if (ours) return true;
+  }
+}
+
+void AudioSource::seek(double seconds) {
+  const int64_t ts = static_cast<int64_t>(seconds * AV_TIME_BASE);
+  check(avformat_seek_file(format_, -1, INT64_MIN, ts, ts, 0), "seek audio");
+  decoder_->flush();
+}
+
 }  // namespace advp

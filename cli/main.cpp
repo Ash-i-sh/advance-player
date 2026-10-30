@@ -9,6 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -18,6 +22,7 @@
 #include "advp/convert.h"
 #include "advp/device.h"
 #include "advp/engine.h"
+#include "advp/link.h"
 #include "advp/player.h"
 #include "advp/rate.h"
 
@@ -31,9 +36,10 @@ void usage() {
                "  advp bench [--size 1920x1080] [--source-fps 23.976] [--fps auto|60|120]\n"
                "  advp convert IN OUT [--fps 60] [--engine auto|NAME] [--codec hevc|h264]\n"
                "                      [--quality 1-100] [--frames N]\n"
-               "  advp play FILE [--fps display|fit:60|60] [--engine auto|off|NAME] [--start S]\n"
+               "  advp play FILE|LINK [--fps display|fit:60|60] [--engine auto|off|NAME] [--start S]\n"
                "                 [--seconds N] [--fullscreen] [--volume 0-100] [--no-audio]\n"
-               "                 [--screenshot FILE.png] [--actions 2:pause,4:pause,5:forward]\n");
+               "                 [--screenshot FILE.png] [--actions 2:pause,4:pause,5:forward]\n"
+               "                 [--max-height 2160]   (LINK: a video page, opened with yt-dlp)\n");
 }
 
 // Returns the value after a flag, or nullptr if the flag is absent.
@@ -138,6 +144,52 @@ int cmd_convert(const std::vector<std::string>& args) {
   return 0;
 }
 
+// yt-dlp: $ADVP_YTDLP, else the copy in the project's .venv next to the
+// build directory, else the one on PATH.
+std::string find_ytdlp() {
+  if (const char* env = std::getenv("ADVP_YTDLP")) return env;
+#if defined(__APPLE__)
+  char exe[4096];
+  uint32_t size = sizeof exe;
+  if (_NSGetExecutablePath(exe, &size) == 0) {
+    std::error_code ec;
+    const auto venv = std::filesystem::canonical(exe, ec).parent_path().parent_path() / ".venv/bin/yt-dlp";
+    if (!ec && std::filesystem::exists(venv)) return venv.string();
+  }
+#endif
+  return "yt-dlp";
+}
+
+// Fills the play options from a web page address.
+bool open_link(advp::PlayOptions& opt, const std::string& url, const std::vector<std::string>& args) {
+  advp::LinkOptions link;
+  link.ytdlp = find_ytdlp();
+  if (const char* v = flag(args, "--max-height")) link.max_height = std::atoi(v);
+  // Hardware-decoded codecs first; among them, the most compact first.
+  const auto hw = advp::probe_device().hw_decoders;
+  for (const char* codec : {"av1", "hevc", "vp9", "h264"}) {
+    if (std::find(hw.begin(), hw.end(), codec) != hw.end()) link.hardware_codecs.push_back(codec);
+  }
+  std::fprintf(stderr, "resolving link with %s ...\n", link.ytdlp.c_str());
+  try {
+    const advp::LinkStreams s = advp::resolve_link(url, link);
+    std::printf("link: %s (formats %s)\n", s.title.c_str(), s.format.c_str());
+    opt.input = s.video_url;
+    opt.audio_input = s.audio_url;
+    opt.title = s.title;
+    std::string headers;
+    for (const auto& [key, value] : s.http_headers) headers += key + ": " + value + "\r\n";
+    opt.input_options = {{"reconnect", "1"},
+                         {"reconnect_on_network_error", "1"},
+                         {"reconnect_delay_max", "4"}};
+    if (!headers.empty()) opt.input_options["headers"] = headers;
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
+    return false;
+  }
+}
+
 int cmd_play(const std::vector<std::string>& args) {
   if (args.empty()) {
     usage();
@@ -145,6 +197,7 @@ int cmd_play(const std::vector<std::string>& args) {
   }
   advp::PlayOptions opt;
   opt.input = args[0];
+  if (advp::is_link(args[0]) && !open_link(opt, args[0], args)) return 1;
   if (const char* v = flag(args, "--engine")) opt.engine = v;
   if (const char* v = flag(args, "--fps")) opt.fps = v;
   if (const char* v = flag(args, "--start")) opt.start = std::atof(v);
