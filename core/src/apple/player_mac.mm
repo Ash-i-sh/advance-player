@@ -435,6 +435,7 @@ class Player {
   void choose_output_rate() {
     const std::string& fps = opt_.fps;
     const double hz = display_hz_;
+    rate_hz_ = hz;
     if (fps.empty() || fps == "display") {
       output_fps_ = 0;
     } else if (fps.rfind("fit:", 0) == 0) {
@@ -448,7 +449,7 @@ class Player {
     }
     // Rates within 0.5% of the refresh are treated as the refresh itself.
     if (output_fps_ > 0 && std::fabs(output_fps_ / hz - 1.0) < 0.005) output_fps_ = 0;
-    const double rate = output_fps_ > 0 ? output_fps_ : hz;
+    const double rate = output_fps_ > 0 ? output_fps_.load() : hz;
     const double hold = hz / rate;
     result_.output_fps = rate;
     result_.even_cadence = std::fabs(hold - std::round(hold)) < 0.01 && hold >= 0.99;
@@ -456,7 +457,7 @@ class Player {
   }
 
   void choose_engines() {
-    const double out_fps = output_fps_ > 0 ? output_fps_ : display_hz_.load();
+    const double out_fps = output_fps_ > 0 ? output_fps_.load() : display_hz_.load();
     if (opt_.engine == "auto") {
       // Measure here, at this video's size, rather than trusting a device list.
       const auto bench = benchmark_engines(backend_, result_.width, result_.height, 12);
@@ -636,6 +637,20 @@ class Player {
     if (out->videoTimeScale > 0 && out->videoRefreshPeriod > 0) {
       period = static_cast<double>(out->videoRefreshPeriod) / out->videoTimeScale;
       if (std::fabs(period * display_hz_ - 1.0) > 0.01) set_refresh_period(period);
+    }
+    if (std::fabs(display_hz_ / rate_hz_ - 1.0) > 0.01) {
+      // Now on a screen with another refresh rate: pick the output rate for
+      // it ("fit:60" is 60 on 120 Hz, 37.5 on 75 Hz) and restart the
+      // timeline from the current picture.
+      choose_output_rate();
+      std::fprintf(stderr, "now on a %.1f Hz display: output %.2f fps\n", display_hz_.load(),
+                   output_fps_ > 0 ? output_fps_.load() : display_hz_.load());
+      std::lock_guard<std::mutex> lock(mu_);
+      if (clock_running_ && !paused_) {
+        clock_running_ = false;
+        restart_media_ = current_media_;
+        clock_.stop();
+      }
     }
 
     double media = 0;
@@ -1013,6 +1028,16 @@ class Player {
       smoothing_ = !smoothing_;
     } else if (command == "fullscreen") {
       [window_ toggleFullScreen:nil];
+    } else if (command == "next-screen") {
+      NSArray<NSScreen*>* screens = NSScreen.screens;
+      const NSUInteger at = [screens indexOfObject:window_.screen];
+      if (screens.count > 1 && at != NSNotFound) {
+        const NSRect area = screens[(at + 1) % screens.count].visibleFrame;
+        NSRect frame = window_.frame;
+        frame.origin = NSMakePoint(NSMidX(area) - frame.size.width / 2,
+                                   NSMidY(area) - frame.size.height / 2);
+        [window_ setFrame:frame display:YES];
+      }
     } else if (command == "back" || command == "forward") {
       seek_by(command == "back" ? -kSeekStep : kSeekStep);
     } else if (command == "mute") {
@@ -1078,7 +1103,7 @@ class Player {
         stringWithFormat:@"%@ — %s%s · %.3f → %.2f fps on %.0f Hz · GPU %.1f ms · missed %lld · %.0f s%s%s",
                          name, smoothing_ ? engine.c_str() : "off",
                          smoothing_ ? "" : " (S)", result_.source_fps,
-                         output_fps_ > 0 ? output_fps_ : display_hz_.load(),
+                         output_fps_ > 0 ? output_fps_.load() : display_hz_.load(),
                          display_hz_.load(), recent_work_ms_.load(), static_cast<long long>(missed), media,
                          audio_out_ ? (muted_ ? " · muted" : [NSString stringWithFormat:@" · vol %.0f%%", volume_ * 100].UTF8String) : "",
                          paused ? " · paused" : ""];
@@ -1244,7 +1269,8 @@ class Player {
     int64_t slot;
     GpuFramePtr frame;
   };
-  double output_fps_ = 0;
+  std::atomic<double> output_fps_{0};  // also read by the title
+  double rate_hz_ = 60;  // refresh rate output_fps_ was chosen for
   double work_sum_ = 0;
   double window_sum_ = 0;
   uint64_t out_generation_ = 0;

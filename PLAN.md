@@ -203,6 +203,9 @@ kept as a possible later addition for other apps' video.
   0.000 ms timing error at 1080p), and 4K 10-bit keeps `motion-fast` where
   the full refresh rate could only afford `blend`. The governor now judges
   load per source frame and ignores the first 0.5 s after a start or seek.
+  The rate is picked again when the window moves to a screen with another
+  refresh rate (found by the owner: `fit:60` kept 50 fps on the 75 Hz screen,
+  an uneven cadence with ~2,500 missed refreshes in a full trailer).
 - Motion tuning (2026-10-29). The benchmark was fixed first: its frame
   pairing was off by one frame on some timestamps (the "26–29 dB outliers"
   were that), and ffmpeg's whole-pixel crop made the reference pan itself

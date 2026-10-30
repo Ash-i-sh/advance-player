@@ -18,7 +18,8 @@ namespace advp {
 
 // A control run at a set time after start, as if its key were pressed:
 // "pause", "back", "forward", "smoothing", "mute", "louder", "quieter",
-// "fullscreen", "quit". For scripted tests of the controls.
+// "fullscreen", "quit", and "next-screen" (moves the window to the next
+// display). For scripted tests of the controls.
 struct PlayAction {
   double at = 0;  // seconds after the window opens
   std::string command;
