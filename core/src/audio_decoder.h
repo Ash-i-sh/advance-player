@@ -27,7 +27,9 @@ struct AudioChunk {
 
 class AudioDecoder {
  public:
-  explicit AudioDecoder(AVStream* stream);
+  // out_rate: sample rate to deliver (0: the stream's own). Tracks switched
+  // during playback are resampled to the rate the output was opened with.
+  explicit AudioDecoder(AVStream* stream, int out_rate = 0);
   ~AudioDecoder();
   AudioDecoder(const AudioDecoder&) = delete;
   AudioDecoder& operator=(const AudioDecoder&) = delete;
@@ -54,7 +56,7 @@ class AudioDecoder {
   int swr_format_ = -1;
   int swr_channels_ = 0;
   int index_ = -1;
-  int rate_ = 0;
+  int rate_ = 0;  // output rate
   double time_base_ = 0;
   double next_time_ = 0;
   bool have_time_ = false;

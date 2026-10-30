@@ -47,17 +47,19 @@ if(APPLE AND EXISTS "${ADVP_FFMPEG_DIR}/include/libavcodec/avcodec.h")
     core/src/video_decoder.cpp
     core/src/audio_decoder.cpp
     core/src/link.cpp
+    core/src/subtitles.cpp
     core/src/convert.cpp
     core/src/apple/metal_backend.mm
     core/src/apple/device_apple.mm
     core/src/apple/player_mac.mm
     core/src/apple/audio_output.mm
+    core/src/apple/subtitle_overlay.mm
   )
   target_include_directories(advp_media
     PUBLIC core/include
     PRIVATE core/src "${CMAKE_BINARY_DIR}/generated" "${ADVP_FFMPEG_DIR}/include")
   set_source_files_properties(core/src/apple/metal_backend.mm core/src/apple/device_apple.mm
-    core/src/apple/player_mac.mm core/src/apple/audio_output.mm
+    core/src/apple/player_mac.mm core/src/apple/audio_output.mm core/src/apple/subtitle_overlay.mm
     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   target_link_directories(advp_media PUBLIC "${ADVP_FFMPEG_DIR}/lib")
   target_link_libraries(advp_media PUBLIC
@@ -66,7 +68,7 @@ if(APPLE AND EXISTS "${ADVP_FFMPEG_DIR}/include/libavcodec/avcodec.h")
     "-framework Foundation" "-framework AppKit" "-framework Metal"
     "-framework CoreVideo" "-framework CoreMedia" "-framework VideoToolbox"
     "-framework QuartzCore" "-framework ImageIO" "-framework UniformTypeIdentifiers"
-    "-framework AudioToolbox" "-framework CoreAudio")
+    "-framework AudioToolbox" "-framework CoreAudio" "-framework CoreText")
 
   add_executable(advp cli/main.cpp)
   target_link_libraries(advp PRIVATE advp_media)

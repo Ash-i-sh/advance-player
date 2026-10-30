@@ -90,7 +90,13 @@ build/advp play "https://www.youtube.com/watch?v=VIDEO_ID" --fps fit:60
 ```
 
 Player keys: space pause, ←/→ seek 10 s, S smoothing on/off (before/after),
-M mute, ↑/↓ volume, F full screen, Q or Esc quit.
+M mute, ↑/↓ volume, A next audio track, J next subtitle track (or off),
+F full screen, Q or Esc quit.
+
+Subtitles: embedded tracks (SRT, ASS, WebVTT, mov_text; Blu-ray PGS and DVD
+pictures) and `--sub-file film.srt`; `--sub N|off` and `--audio-track N`
+choose tracks. They are drawn over the picture after smoothing, so text is
+never interpolated. ASS styling (fonts, colours, positions) is not drawn yet.
 `--engine off|blend|motion-fast|motion` fixes the engine; `--seconds N` stops
 after N seconds and prints pacing and audio sync stats; `--screenshot
 frame.png` saves one smoothed frame as displayed; `--volume 0-100` and

@@ -38,7 +38,8 @@ void usage() {
                "                      [--quality 1-100] [--frames N]\n"
                "  advp play FILE|LINK [--fps display|fit:60|60] [--engine auto|off|NAME] [--start S]\n"
                "                 [--seconds N] [--fullscreen] [--volume 0-100] [--no-audio]\n"
-               "                 [--screenshot FILE.png] [--actions 2:pause,4:pause,5:forward]\n"
+               "                 [--screenshot FILE.png [--screenshot-after S]] [--actions 2:pause,4:pause,5:forward]\n"
+               "                 [--audio-track N] [--sub N|off] [--sub-file FILE.srt]\n"
                "                 [--max-height 2160]   (LINK: a video page, opened with yt-dlp)\n");
 }
 
@@ -203,7 +204,11 @@ int cmd_play(const std::vector<std::string>& args) {
   if (const char* v = flag(args, "--start")) opt.start = std::atof(v);
   if (const char* v = flag(args, "--seconds")) opt.max_seconds = std::atof(v);
   if (const char* v = flag(args, "--screenshot")) opt.screenshot = v;
+  if (const char* v = flag(args, "--screenshot-after")) opt.screenshot_after = std::atof(v);
   if (const char* v = flag(args, "--volume")) opt.volume = static_cast<float>(std::atof(v) / 100.0);
+  if (const char* v = flag(args, "--audio-track")) opt.audio_track = std::atoi(v);
+  if (const char* v = flag(args, "--sub")) opt.subtitle_track = std::strcmp(v, "off") == 0 ? 0 : std::atoi(v);
+  if (const char* v = flag(args, "--sub-file")) opt.subtitle_file = v;
   if (const char* v = flag(args, "--actions")) {
     // "2:pause,4:pause,5:forward": seconds after start, then the control.
     std::string list = v;
@@ -243,6 +248,7 @@ int cmd_play(const std::vector<std::string>& args) {
       static_cast<long long>(r.missed), static_cast<long long>(r.underflows), r.work_ms_mean,
       r.work_ms_p99, r.work_ms_max, r.interval_jitter_ms);
   std::printf("audio: %s\n", r.audio.c_str());
+  std::printf("subtitles: %s\n", r.subtitles.c_str());
   if (r.audio_latency_ms > 0) {
     std::printf(
         "audio sync vs. video clock: mean %.2f ms, max %.2f ms; device latency %.1f ms;\n"

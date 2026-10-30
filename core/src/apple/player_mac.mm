@@ -34,7 +34,9 @@
 #include "advp/schedule.h"
 #include "advp_shaders.h"
 #include "apple/audio_output.h"
+#include "apple/subtitle_overlay.h"
 #include "audio_decoder.h"
+#include "subtitles.h"
 #include "video_decoder.h"
 
 extern "C" {
@@ -225,6 +227,7 @@ class Player {
     aspect_ = static_cast<double>(par->width) / par->height *
               (sar.num > 0 && sar.den > 0 ? av_q2d(sar) : 1.0);
     open_audio();
+    open_subtitles();
 
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -301,8 +304,16 @@ class Player {
       return;
     }
     AVFormatContext* format = decoder_->format();
-    const int index = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1,
-                                          decoder_->video_index(), nullptr, 0);
+    for (unsigned i = 0; i < format->nb_streams; ++i) {
+      if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        audio_streams_.push_back(static_cast<int>(i));
+      }
+    }
+    int index = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, decoder_->video_index(),
+                                    nullptr, 0);
+    if (opt_.audio_track > 0 && opt_.audio_track <= static_cast<int>(audio_streams_.size())) {
+      index = audio_streams_[opt_.audio_track - 1];
+    }
     if (index < 0) {
       result_.audio = "none in file";
       return;
@@ -313,11 +324,52 @@ class Player {
                                                  AudioDecoder::channels(), clock_);
       audio_out_->set_volume(volume_);
       result_.audio = audio_decoder_->description();
+      audio_stream_ = index;
     } catch (const std::exception& e) {
       audio_out_.reset();
       audio_decoder_.reset();
       result_.audio = std::string("unavailable (") + e.what() + ")";
     }
+  }
+
+  // Every subtitle track of the file is decoded as it is read (they are
+  // small), so switching tracks is instant; an external file is read whole.
+  void open_subtitles() {
+    AVFormatContext* format = decoder_->format();
+    int number = 0;
+    int preferred = -1;
+    for (unsigned i = 0; i < format->nb_streams; ++i) {
+      AVStream* stream = format->streams[i];
+      if (stream->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
+      ++number;
+      const bool is_default = stream->disposition & (AV_DISPOSITION_DEFAULT | AV_DISPOSITION_FORCED);
+      auto track = std::make_unique<SubtitleTrack>(stream_label(stream, number), is_default);
+      try {
+        subtitle_decoders_.push_back(std::make_unique<SubtitleDecoder>(stream, *track));
+      } catch (const std::exception&) {
+        continue;  // a format we cannot decode: leave it out
+      }
+      if (is_default && preferred < 0) preferred = static_cast<int>(subtitle_tracks_.size());
+      subtitle_tracks_.push_back(std::move(track));
+    }
+    std::string problem;
+    if (!opt_.subtitle_file.empty()) {
+      try {
+        subtitle_tracks_.push_back(load_subtitle_file(opt_.subtitle_file));
+        preferred = static_cast<int>(subtitle_tracks_.size()) - 1;
+      } catch (const std::exception& e) {
+        problem = std::string(" (") + opt_.subtitle_file + ": " + e.what() + ")";
+      }
+    }
+    const int count = static_cast<int>(subtitle_tracks_.size());
+    if (opt_.subtitle_track == 0) {
+      subtitle_track_ = -1;
+    } else if (opt_.subtitle_track > 0 && opt_.subtitle_track <= count) {
+      subtitle_track_ = opt_.subtitle_track - 1;
+    } else {
+      subtitle_track_ = preferred;
+    }
+    result_.subtitles = std::to_string(count) + (count == 1 ? " track" : " tracks") + problem;
   }
 
   void setup_metal() {
@@ -337,6 +389,7 @@ class Player {
     d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pipeline_ = [device_ newRenderPipelineStateWithDescriptor:d error:&error];
     if (!pipeline_) throw std::runtime_error("cannot build present pipeline");
+    overlay_ = std::make_unique<SubtitleOverlay>(device_, library);
     if (CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr, device_, nullptr, &cache_) !=
         kCVReturnSuccess) {
       throw std::runtime_error("cannot create Metal texture cache");
@@ -499,6 +552,12 @@ class Player {
       }
       // Audio packets arrive while reading video; decode them on the way.
       const auto on_other = [&](AVPacket* packet) {
+        for (const auto& sub : subtitle_decoders_) {
+          if (packet->stream_index == sub->stream_index()) {
+            sub->decode(packet);
+            return;
+          }
+        }
         if (!audio_decoder_ || packet->stream_index != audio_decoder_->stream_index()) return;
         audio_decoder_->decode(packet, [&](const AudioChunk& chunk) {
           const double end = chunk.time + static_cast<double>(chunk.frames) / audio_decoder_->sample_rate();
@@ -535,6 +594,16 @@ class Player {
         if (seek_to) {
           decoder_->seek(*seek_to);
           if (audio_decoder_) {
+            const int wanted = audio_stream_;
+            if (wanted != audio_decoder_->stream_index()) {
+              // Another track: resampled to the rate the output already runs at.
+              try {
+                audio_decoder_ = std::make_unique<AudioDecoder>(
+                    decoder_->format()->streams[wanted], audio_decoder_->sample_rate());
+              } catch (const std::exception&) {
+                audio_stream_ = audio_decoder_->stream_index();  // keep the old one
+              }
+            }
             audio_decoder_->flush();
             audio_out_->reset();
           }
@@ -703,7 +772,7 @@ class Player {
     double work_ms = 0;
     const GpuFramePtr frame = render(pick, playing, &work_ms);
     report_work(work_ms, period * 1000.0, playing);
-    draw(frame, present_at,
+    draw(frame, present_at, media,
          playing ? std::optional<Measure>(Measure{generation, period}) : std::nullopt);
     maybe_screenshot(frame, pick, present_at, playing);
     analyse_next(pick);
@@ -739,7 +808,7 @@ class Player {
       }
       ready_.reset();
       const double expected = slot_host(slot, period) - slot_host(slot - 1, period);
-      draw(frame, present_at,
+      draw(frame, present_at, slot_time(slot),
            playing && shown_slot_ >= 0 && slot == shown_slot_ + 1
                ? std::optional<Measure>(Measure{generation, expected})
                : std::nullopt);
@@ -876,7 +945,9 @@ class Player {
     double expected;  // seconds after the previous frame
   };
 
-  void draw(const GpuFramePtr& frame, double present_at, std::optional<Measure> measure) {
+  // media: the playback time this frame shows, for subtitles.
+  void draw(const GpuFramePtr& frame, double present_at, double media,
+            std::optional<Measure> measure) {
     id<CAMetalDrawable> drawable = [layer_ nextDrawable];
     if (!drawable) return;
 
@@ -898,7 +969,12 @@ class Player {
       throw std::runtime_error("cannot map frame for display");
     }
     id<MTLCommandBuffer> cb = [queue_ commandBuffer];
-    encode_present(cb, buffer, y_ref, uv_ref, drawable.texture);
+    const id<MTLTexture> target = drawable.texture;
+    const int track = subtitle_track_;
+    overlay_->set(track >= 0 ? subtitle_tracks_[track]->at(media)
+                             : std::vector<std::shared_ptr<const SubtitleCue>>{},
+                  video_rect(target.width, target.height), result_.width, result_.height);
+    encode_present(cb, buffer, y_ref, uv_ref, target, true);
 
     if (measure) {
       std::shared_ptr<PresentStats> stats = stats_;
@@ -918,8 +994,20 @@ class Player {
   }
 
   // YCbCr -> RGB into target, letterboxed to the video's display aspect.
+  // Where the picture sits in a target of this size: centred, at the
+  // video's display aspect (pixels, origin top left).
+  CGRect video_rect(double dw, double dh) const {
+    double vw = dw, vh = dw / aspect_;
+    if (vh > dh) {
+      vh = dh;
+      vw = dh * aspect_;
+    }
+    return CGRectMake((dw - vw) / 2, (dh - vh) / 2, vw, vh);
+  }
+
+  // subtitles: also draw the overlay's current cues on top.
   void encode_present(id<MTLCommandBuffer> cb, CVPixelBufferRef buffer, CVMetalTextureRef y_ref,
-                      CVMetalTextureRef uv_ref, id<MTLTexture> target) {
+                      CVMetalTextureRef uv_ref, id<MTLTexture> target, bool subtitles = false) {
     const PresentParams params = present_params(buffer);
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = target;
@@ -941,6 +1029,7 @@ class Player {
     [enc setFragmentTexture:CVMetalTextureGetTexture(uv_ref) atIndex:1];
     [enc setFragmentBytes:&params length:sizeof params atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    if (subtitles) overlay_->encode(enc, dw, dh);
     [enc endEncoding];
   }
 
@@ -974,7 +1063,9 @@ class Player {
     d.storageMode = MTLStorageModeShared;
     id<MTLTexture> target = [device_ newTextureWithDescriptor:d];
     id<MTLCommandBuffer> cb = [queue_ commandBuffer];
-    encode_present(cb, buffer, y_ref, uv_ref, target);
+    // With the subtitles on screen now, laid out for this size.
+    overlay_->set(overlay_->cues(), CGRectMake(0, 0, w, h), result_.width, result_.height);
+    encode_present(cb, buffer, y_ref, uv_ref, target, true);
     [cb commit];
     [cb waitUntilCompleted];
     CFRelease(y_ref);
@@ -1011,6 +1102,8 @@ class Player {
     else if ([chars isEqualToString:@"s"]) command = "smoothing";
     else if ([chars isEqualToString:@"f"]) command = "fullscreen";
     else if ([chars isEqualToString:@"m"]) command = "mute";
+    else if ([chars isEqualToString:@"a"]) command = "audio-track";
+    else if ([chars isEqualToString:@"j"]) command = "sub-track";
     else if (code == 123) command = "back";
     else if (code == 124) command = "forward";
     else if (code == 126) command = "louder";
@@ -1040,6 +1133,13 @@ class Player {
       }
     } else if (command == "back" || command == "forward") {
       seek_by(command == "back" ? -kSeekStep : kSeekStep);
+    } else if (command == "audio-track") {
+      next_audio_track();
+    } else if (command == "sub-track") {
+      // Cycles through the tracks, then off.
+      const int count = static_cast<int>(subtitle_tracks_.size());
+      const int next = subtitle_track_ + 1;
+      subtitle_track_ = next < count ? next : -1;
     } else if (command == "mute") {
       muted_ = !muted_;
     } else if (command == "louder" || command == "quieter") {
@@ -1049,6 +1149,16 @@ class Player {
     }
     if (audio_out_) audio_out_->set_volume(muted_ ? 0.f : volume_);
     update_title();
+  }
+
+  // Switches to the file's next audio track. The decoder has read past the
+  // current position, so playback jumps back to here to refill the sound.
+  void next_audio_track() {
+    if (!audio_decoder_ || audio_streams_.size() < 2) return;
+    const auto it = std::find(audio_streams_.begin(), audio_streams_.end(), audio_stream_.load());
+    const size_t at = it == audio_streams_.end() ? 0 : static_cast<size_t>(it - audio_streams_.begin());
+    audio_stream_ = audio_streams_[(at + 1) % audio_streams_.size()];
+    seek_by(0);
   }
 
   void toggle_pause() {
@@ -1105,8 +1215,25 @@ class Player {
                          smoothing_ ? "" : " (S)", result_.source_fps,
                          output_fps_ > 0 ? output_fps_.load() : display_hz_.load(),
                          display_hz_.load(), recent_work_ms_.load(), static_cast<long long>(missed), media,
-                         audio_out_ ? (muted_ ? " · muted" : [NSString stringWithFormat:@" · vol %.0f%%", volume_ * 100].UTF8String) : "",
+                         (audio_out_ ? (muted_ ? std::string(" · muted") : " · vol " + std::to_string(std::lround(volume_ * 100)) + "%") +
+                                           track_titles()
+                                     : track_titles()).c_str(),
                          paused ? " · paused" : ""];
+  }
+
+  // " · audio 2/3 · sub #1 eng" for the title.
+  std::string track_titles() const {
+    std::string s;
+    if (audio_streams_.size() > 1) {
+      const auto it = std::find(audio_streams_.begin(), audio_streams_.end(), audio_stream_.load());
+      s += " · audio " + std::to_string(it - audio_streams_.begin() + 1) + "/" +
+           std::to_string(audio_streams_.size());
+    }
+    if (!subtitle_tracks_.empty()) {
+      const int track = subtitle_track_;
+      s += " · sub " + (track >= 0 ? subtitle_tracks_[track]->name() : std::string("off"));
+    }
+    return s;
   }
 
   // ---- shutdown -------------------------------------------------------------
@@ -1203,6 +1330,12 @@ class Player {
   // Audio; null when the file has none or there is no output device.
   MediaClock clock_;
   std::unique_ptr<AudioDecoder> audio_decoder_;  // audio inside the video input
+  std::vector<int> audio_streams_;   // the file's audio streams
+  std::atomic<int> audio_stream_{-1};  // the one playing, or asked for
+  std::vector<std::unique_ptr<SubtitleTrack>> subtitle_tracks_;  // fixed once playing
+  std::vector<std::unique_ptr<SubtitleDecoder>> subtitle_decoders_;  // decode thread
+  std::atomic<int> subtitle_track_{-1};  // shown track, -1 off
+  std::unique_ptr<SubtitleOverlay> overlay_;  // display thread
   std::unique_ptr<AudioSource> audio_source_;    // or a separate audio input
   std::unique_ptr<AudioOutput> audio_out_;
   std::thread audio_thread_;

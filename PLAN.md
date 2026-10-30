@@ -306,9 +306,23 @@ kept as a possible later addition for other apps' video.
   videos (YouTube may cut long single-connection reads; yt-dlp downloads in
   10 MB ranges), expiring stream URLs (~6 h) on long pauses, other sites,
   Windows. Legal review still required before launch (§6).
+- Subtitles and track choice (M1, 2026-10-30): every subtitle track in the
+  file is decoded as it is read (they are small), so switching is instant;
+  external files are read whole. Text is drawn with CoreText (white,
+  outlined, shadowed, wrapped to 90% of the picture, sized to its height)
+  into a texture once per cue and blended over the picture after smoothing.
+  Bitmap tracks (PGS, DVD) keep their image and position. Audio tracks
+  switch by jumping back to the current position, resampled to the rate the
+  output already runs at. Checked by screenshot: SRT with two lines, Tamil
+  and Hindi text, wrapping; ASS with tags removed and forced breaks; an
+  external .srt; scripted switching of both kinds, 6 runs, no crashes.
+  Not done: ASS styling (needs libass), bitmap subtitles untested (no sample
+  file), subtitles for links. Open: about 1 run in 3 on the test clip shows
+  a few audio underruns, with or without switching; suspected to be the GPU
+  being held at 100% by a browser tab, not yet confirmed.
 - Waiting on owner: macOS 15.4+ and Xcode (Flutter UI, VideoToolbox L3 engine).
   Free disk space (~10 GB) must be raised first.
-- Next without Xcode: subtitles and audio-track choice,
+- Next without Xcode:
   temporal vector prediction (steadier vectors between pairs), cheaper 4K
   motion.
 

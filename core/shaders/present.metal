@@ -34,3 +34,23 @@ fragment float4 present_fragment(PresentVertex in [[stage_in]],
                             y + p.matrix.w * c.x);
   return float4(saturate(rgb), 1.0);
 }
+
+// Subtitle overlay: a textured rectangle (corners in normalised device
+// coordinates, x0 y0 x1 y1, y up) blended with premultiplied alpha.
+struct OverlayVertex {
+  float4 position [[position]];
+  float2 uv;
+};
+
+vertex OverlayVertex overlay_vertex(uint id [[vertex_id]], constant float4& rect [[buffer(0)]]) {
+  const float2 p = float2(id & 1, id >> 1);  // triangle strip: TL, TR, BL, BR
+  OverlayVertex out;
+  out.position = float4(mix(rect.x, rect.z, p.x), mix(rect.y, rect.w, p.y), 0.0, 1.0);
+  out.uv = p;
+  return out;
+}
+
+fragment float4 overlay_fragment(OverlayVertex in [[stage_in]], texture2d<float> image [[texture(0)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  return image.sample(s, in.uv);
+}

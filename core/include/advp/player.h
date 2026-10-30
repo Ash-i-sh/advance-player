@@ -18,8 +18,9 @@ namespace advp {
 
 // A control run at a set time after start, as if its key were pressed:
 // "pause", "back", "forward", "smoothing", "mute", "louder", "quieter",
-// "fullscreen", "quit", and "next-screen" (moves the window to the next
-// display). For scripted tests of the controls.
+// "fullscreen", "quit", "audio-track" and "sub-track" (next track), and
+// "next-screen" (moves the window to the next display). For scripted tests
+// of the controls.
 struct PlayAction {
   double at = 0;  // seconds after the window opens
   std::string command;
@@ -50,6 +51,9 @@ struct PlayOptions {
   double screenshot_after = 1.0;  // seconds of playback first
   bool no_audio = false;
   float volume = 1.f;  // 0..1
+  int audio_track = 0;     // 1-based among the file's audio tracks; 0: the best one
+  int subtitle_track = -1;  // 1-based (embedded tracks, then the file); 0: off; -1: auto
+  std::string subtitle_file;  // .srt, .ass, .vtt ...; shown by default
   std::vector<PlayAction> actions;
 };
 
@@ -85,6 +89,7 @@ struct PlayResult {
   int64_t audio_resyncs = 0;    // large corrections once playing had settled
   double audio_sync_ms_mean = 0;  // audio vs. video clock while settled
   double audio_sync_ms_max = 0;
+  std::string subtitles;  // tracks found and the one shown
   double seconds = 0;
 };
 
@@ -92,7 +97,8 @@ struct PlayResult {
 // closed. Must be called on the main thread.
 //
 // Keys: space pause, left/right seek 10 s, S smoothing on/off (before/after),
-// M mute, up/down volume, F full screen, Q or Esc quit.
+// M mute, up/down volume, A next audio track, J next subtitle track (or
+// off), F full screen, Q or Esc quit.
 PlayResult play_file(GpuBackend& backend, const PlayOptions& options);
 
 }  // namespace advp

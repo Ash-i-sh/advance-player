@@ -13,7 +13,7 @@ extern "C" {
 
 namespace advp {
 
-AudioDecoder::AudioDecoder(AVStream* stream) : index_(stream->index) {
+AudioDecoder::AudioDecoder(AVStream* stream, int out_rate) : index_(stream->index) {
   frame_ = av_frame_alloc();
   try {
     const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
@@ -22,8 +22,8 @@ AudioDecoder::AudioDecoder(AVStream* stream) : index_(stream->index) {
     check(avcodec_parameters_to_context(codec_, stream->codecpar), "audio decoder parameters");
     codec_->pkt_timebase = stream->time_base;
     check(avcodec_open2(codec_, codec, nullptr), "open audio decoder");
-    rate_ = codec_->sample_rate;
-    if (rate_ <= 0) throw std::runtime_error("audio stream has no sample rate");
+    if (codec_->sample_rate <= 0) throw std::runtime_error("audio stream has no sample rate");
+    rate_ = out_rate > 0 ? out_rate : codec_->sample_rate;
     time_base_ = av_q2d(stream->time_base);
   } catch (...) {
     avcodec_free_context(&codec_);
@@ -41,8 +41,8 @@ AudioDecoder::~AudioDecoder() {
 
 std::string AudioDecoder::description() const {
   char buf[96];
-  std::snprintf(buf, sizeof buf, "%s, %d Hz, %d ch", avcodec_get_name(codec_->codec_id), rate_,
-                codec_->ch_layout.nb_channels);
+  std::snprintf(buf, sizeof buf, "%s, %d Hz, %d ch", avcodec_get_name(codec_->codec_id),
+                codec_->sample_rate, codec_->ch_layout.nb_channels);
   return buf;
 }
 
