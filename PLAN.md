@@ -288,8 +288,9 @@ kept as a possible later addition for other apps' video.
   the M4 decodes it with the CPU nearly idle), sound as Opus (not the "-drc"
   variants). The sound gets its own input and thread, so a slow network read
   for it never holds up the picture; HTTP headers come from yt-dlp per stream.
-  Measured on a 2.5-minute 4K trailer: link to first frame ~5 s (~3 s of it
-  yt-dlp); FFmpeg reads the 4K AV1 stream at ~2.8x real time over this
+  Measured on a 2.5-minute 4K trailer: yt-dlp takes ~3 s to resolve the
+  link, and once the window is open, playback starts ~3 s later than for the
+  same file on disk (opening both streams and the 1.5 s read-ahead); FFmpeg reads the 4K AV1 stream at ~2.8x real time over this
   connection (one HTTP connection per stream, no throttling seen in 60 s).
   First runs stalled: 12–18 decoder underflows in 25 s with seeks, none for
   the same file played locally. Two fixes: compressed packets are read up to
